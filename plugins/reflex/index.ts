@@ -12,9 +12,11 @@ type ProviderPreset =
 
 // Default base URLs per provider preset. Every preset below serves the same
 // System One request shape (model, state, questions) at <baseURL>/systemone:
-// the local runtimes' System One API, the TypeSafe API (Jev), OpenRouter's
-// System One surface, the Vercel AI Gateway's TypeSafe-compatible surface and
-// OpenCode Zen. "custom" (or an omitted preset) needs an explicit baseURL.
+// the local runtimes' System One APIs (llama.cpp's, Ollama's and LM Studio's
+// /v1/systemone endpoints — Ollama 0.35 and LM Studio 0.4.26 onwards), the
+// TypeSafe API (Jev), OpenRouter's System One surface, the Vercel AI Gateway's
+// TypeSafe-compatible surface and OpenCode Zen. "custom" (or an omitted
+// preset) needs an explicit baseURL.
 const PRESET_BASE_URLS: Record<string, string | undefined> = {
   llamacpp: "http://127.0.0.1:8080/v1",
   ollama: "http://127.0.0.1:11434/v1",

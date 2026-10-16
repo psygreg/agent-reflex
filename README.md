@@ -7,7 +7,7 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - Deliver more reliable solutions to tasks
 
 ### What works
-- Local system one decision models through llama.cpp
+- Local system one decision models through llama.cpp (0.6 onwards), Ollama (0.35 onwards) and LM Studio (0.4.26 onwards), all serving the same System One endpoint at `<baseURL>/systemone`
 - Use with OpenCode v2 agent
 - Decision-driven history compaction
 - Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp, OpenAI GPT reasoning models, and Z.ai GLM models (GLM-5.2 onwards) in accordance. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin
@@ -24,7 +24,6 @@ For development, add a `"debugLog":` key to the plugin's options pointing to a f
 This requires `npm` or `bun` to compile.
 
 ## TO-DO
-- Use with local system one decision models through Ollama and LM Studio
 - Add automatic effort changing capabilities for local models running through Ollama and LM Studio
 - Add automatic effort changing capabilities for Qwen, Xiaomi and other providers
 - Use with other agents like Claude Code, Hermes, Codex and Qwen Code

@@ -5,8 +5,15 @@
     //
     // Options:
     //   provider       llamacpp | ollama | lmstudio | typesafe | openrouter | vercel |
-    //                  opencode | custom. Sets the default baseURL. The System One
-    //                  presets below all serve the classifier at <baseURL>/systemone:
+    //                  opencode | custom. Sets the default baseURL. Every preset
+    //                  serves the classifier at <baseURL>/systemone:
+    //                    llamacpp   http://127.0.0.1:8080/v1 (llama.cpp server with
+    //                               decision-model support, model like "kev" or
+    //                               any decision GGUF served)
+    //                    ollama    http://127.0.0.1:11434/v1 (Ollama 0.35 onwards,
+    //                               decision model like "nimble" or "d1")
+    //                    lmstudio  http://127.0.0.1:1234/v1 (LM Studio 0.4.26
+    //                               onwards, decision model from the catalog)
     //                    typesafe   https://api.typesafe.ai/v1 (TypeSafe API, Jev,
     //                               model like "jev-latest")
     //                    openrouter https://openrouter.ai/api/v1 (model like
@@ -102,24 +109,28 @@
     //   }
     // },
 
-    // Ollama classifier. The classifier endpoint is not wired for Ollama yet
-    // (see README); the effort hooks still work once the endpoint is available.
+    // Classifier on Ollama (0.35 onwards) with a decision model like "nimble"
+    // (bundled with 0.35) or "d1" (Liquid AI), asked through Ollama's
+    // /v1/systemone endpoint. Older Ollama versions don't serve the endpoint
+    // and every classifier question fails soft (the plugin keeps working
+    // without classification).
     // {
     //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "ollama",
-    //     "model": "qwen2.5:3b"
+    //     "model": "nimble"
     //   }
     // },
 
-    // LM Studio classifier. The classifier endpoint is not wired for LM Studio
-    // yet (see README); the effort hooks still work once the endpoint is
-    // available.
+    // Classifier on LM Studio (0.4.26 onwards) with a decision model from the
+    // catalog, asked through LM Studio's /v1/systemone endpoint. Older LM
+    // Studio versions don't serve the endpoint and every classifier question
+    // fails soft (the plugin keeps working without classification).
     // {
     //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "lmstudio",
-    //     "model": "qwen2.5-3b-instruct"
+    //     "model": "YOUR-DECISION-MODEL-ID"
     //   }
     // },
 
