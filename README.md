@@ -1,5 +1,5 @@
 # agent-orchestrator
-OpenCode plugin for coding agent workflow optimization and safeguarding using any system one decision model, from Jev to self-hosted LM Studio, Ollama or llama.cpp.
+Plugin for coding agent workflow optimization and safeguarding using any system one decision model, from Jev to self-hosted LM Studio, Ollama or llama.cpp.
 
 ### Goals
 - Safeguard against potentially dangerous shell commands
@@ -25,3 +25,4 @@ This requires `npm` or `bun` to compile.
 - Use with external system one decision model providers like TypeSafe Jev
 - Add automatic effort changing capabilities for local models running through Ollama and LM Studio
 - Add automatic effort changing capabilities for OpenAI, Qwen, Z.ai and other providers
+- Use with other agents like Claude Code, Hermes, Codex and Qwen Code
