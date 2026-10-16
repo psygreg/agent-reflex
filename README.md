@@ -18,6 +18,8 @@ Merge the `plugins` directory from this repository with your OpenCode plugins di
 
 For development, add a `"debugLog":` key to the plugin's options pointing to a file to write the logs into.
 
+This requires `npm` or `bun` to compile.
+
 ## TO-DO
 - Use with local system one decision models through Ollama and LM Studio
 - Use with external system one decision model providers like TypeSafe Jev
