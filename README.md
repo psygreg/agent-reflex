@@ -17,11 +17,17 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - TypeSafe Jev and other System One decision models as the classifier, through the TypeSafe API directly, OpenRouter, the Vercel AI Gateway or OpenCode Zen, in addition to local system one decision models through llama.cpp
 
 ## Usage
-Merge the `plugins` directory from this repository with your OpenCode plugins directory, then use whatever configuration block is adequate for your use case from `opencode.example.jsonc`. An automated installation script will be developed once this project becomes more feature-complete.
+Run the installer from the repository root:
 
-For development, add a `"debugLog":` key to the plugin's options pointing to a file to write the logs into.
+```sh
+./install.sh
+```
 
-This requires `npm` or `bun` to compile.
+On a fresh install it asks for the classifier provider (llama.cpp, Ollama, LM Studio, TypeSafe, OpenRouter, Vercel AI Gateway, OpenCode Zen or a custom endpoint), whether a local server runs on the same machine or a remote one (with its base URL), the classifier model, an optional API key (`{env:NAME}` supported), an optional fallback classifier model and an optional debug log path. It copies the plugin into `~/.config/opencode/plugins/reflex/` and adds the plugin entry to `~/.config/opencode/opencode.json(c)` (a `.agent-reflex.bak` backup is kept next to the config, and the merged file is validated before committing). The automatic config merge requires bun; without it the entry is printed for a manual paste.
+
+Re-running the installer only updates the plugin files: an existing installation (plugin copy or config entry) is detected and the configured options are left untouched. After installing or updating, restart OpenCode (`opencode service restart`) to load the plugin.
+
+For development, add a `"debugLog":` key to the plugin's options pointing to a file to write the logs into. Configuration reference examples live in `opencode.example.jsonc`.
 
 ## TO-DO
 - Add automatic effort changing capabilities for local models running through LM Studio (blocked upstream: its OpenAI-compatible endpoint documents no reasoning field yet)
