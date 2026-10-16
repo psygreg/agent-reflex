@@ -12,6 +12,7 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - Decision-driven history compaction
 - Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp and Z.ai GLM models (GLM-5.2 onwards) in accordance
 - Confidence level tool: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check for the confidence level of its current line of thinking before finalizing a response and correct itself in the way if needed
+- Up to two-step syntax checks after `edit` and `write` tool calls using parsers and decision model
 - Shell command check guardrail against commands that may cause damage to a repository or remove files without backup
 
 ## Usage
