@@ -17,15 +17,15 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - TypeSafe Jev and other System One decision models as the classifier, through the TypeSafe API directly, OpenRouter, the Vercel AI Gateway or OpenCode Zen, in addition to local system one decision models through llama.cpp
 
 ## Usage
-Run the installer from the repository root:
+Install the skill using `npx skills add psygreg/agent-reflex` or `bun x skills add psygreg/agent-reflex` then ask your agent to do it: the skill briefs the agent on the plugin's capabilities and installs or updates it — updates need no answers (`bash install.sh </dev/null`), fresh installs collect the answers in chat and pipe them in.
+
+Or run the install script provided in this repository. It will also install the skill so future updates can be performed through the agent itself.
 
 ```sh
 ./install.sh
 ```
 
-Or ask your agent to do it: the repo ships an agent skill (`.opencode/skills/agent-reflex/SKILL.md`, discovered automatically by OpenCode when working in this repository) that briefs on the plugin's capabilities and installs or updates it — updates need no answers (`bash install.sh </dev/null`), fresh installs collect the answers in chat and pipe them in.
-
-On a fresh install it asks for the classifier provider (llama.cpp, Ollama, LM Studio, TypeSafe, OpenRouter, Vercel AI Gateway, OpenCode Zen or a custom endpoint), whether a local server runs on the same machine or a remote one (with its base URL), the classifier model, an optional API key (`{env:NAME}` supported), an optional fallback classifier model and an optional debug log path. It copies the plugin into the plugins directory next to your OpenCode config (`~/.config/opencode/` by default, `~/.opencode/` when your config lives there) and adds the plugin entry to `opencode.json(c)` (a `.agent-reflex.bak` backup is kept next to the config, and the merged file is validated before committing). The automatic config merge requires bun or node (bundled with npm); deno also works. Without any of them the entry is printed for a manual paste.
+On a fresh install it asks for the classifier provider (llama.cpp, Ollama, LM Studio, TypeSafe, OpenRouter, Vercel AI Gateway, OpenCode Zen or a custom endpoint), whether a local server runs on the same machine or a remote one (with its base URL), the classifier model, an optional API key (`{env:NAME}` supported), an optional fallback classifier model and an optional debug log path. It copies the plugin into the plugins directory next to your OpenCode config (`~/.config/opencode/` by default, `~/.opencode/` when your config lives there), installs the repo's agent skill through the skills CLI (`bunx`/`npx skills add`, into the CLI's own canonical path) when no copy exists yet — existing copies are detected and left untouched, so there is never a second installation path — and adds the plugin entry to `opencode.json(c)` (a `.agent-reflex.bak` backup is kept next to the config, and the merged file is validated before committing). The automatic config merge requires bun or node (bundled with npm); deno also works. Without any of them the entry is printed for a manual paste.
 
 Re-running the installer only updates the plugin files: an existing installation (plugin copy or config entry) is detected and the configured options are left untouched. After installing or updating, restart OpenCode (`opencode service restart`) to load the plugin.
 

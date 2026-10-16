@@ -2,10 +2,12 @@
 # agent-reflex installer.
 #
 # First run: interactively walks through the classifier (System One) options,
-# copies the plugin into OpenCode's config directory and adds the plugin entry
-# to the OpenCode config. Re-running only updates the plugin files: an existing
-# installation (plugin copy or config entry) is detected and the configured
-# options are left untouched.
+# copies the plugin into OpenCode's config directory, installs the repo's
+# agent skill (agent-reflex) when it is not installed yet, and adds the plugin
+# entry to the OpenCode config. Re-running only updates the plugin files: an
+# existing installation (plugin copy or config entry) is detected, the
+# configured options and an already-installed skill are left untouched, and a
+# missing skill is still installed.
 #
 # Requires bash and, for the automatic config merge, bun, node (bundled with
 # npm) or deno — the plugin needs a JS/TS runtime to load anyway. Without any
@@ -15,6 +17,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_SRC="$REPO_DIR/plugins/reflex"
+SKILL_SRC="$REPO_DIR/.agents/skills/agent-reflex"
 
 # The global OpenCode config lives in ~/.config/opencode (XDG) or, with some
 # installation methods, ~/.opencode. An existing config file decides the
@@ -97,11 +100,55 @@ update_files() {
   msg "Plugin files updated in ${DIM}${PLUGIN_DEST}${RESET}"
 }
 
+# The repo's agent skill (agent-reflex), installed through the skills CLI
+# (bunx or npx) so there is exactly one canonical, CLI-managed copy — the
+# installer never creates a second installation path itself. Copies the CLI
+# already manages (~/.agents/skills, ~/.claude/skills) or a pre-existing
+# OpenCode copy are detected and left untouched; the skill itself carries a
+# repo-clone fallback for running outside the repository.
+skill_installed() {
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/agent-reflex/SKILL.md" ] && return 0
+  [ -f "$HOME/.agents/skills/agent-reflex/SKILL.md" ] && return 0
+  [ -f "$HOME/.claude/skills/agent-reflex/SKILL.md" ] && return 0
+  return 1
+}
+
+# Runtime for the skills CLI: bunx (bun) or npx (node, bundled with npm).
+SKILLS_CLI=""
+if command -v bunx >/dev/null 2>&1; then
+  SKILLS_CLI="bunx skills"
+elif command -v npx >/dev/null 2>&1; then
+  SKILLS_CLI="npx --yes skills"
+fi
+
+install_skill() {
+  if [ ! -f "$SKILL_SRC/SKILL.md" ]; then
+    return
+  fi
+  if skill_installed; then
+    msg "Skill agent-reflex already installed — left untouched."
+    return
+  fi
+  if [ -z "$SKILLS_CLI" ]; then
+    warn "Skill agent-reflex not installed: no skills CLI runtime (bunx or npx)."
+    warn "Install it later with: npx skills add psygreg/agent-reflex --skill agent-reflex -a opencode -g"
+    return
+  fi
+  local output
+  if output=$($SKILLS_CLI add "$REPO_DIR" --skill agent-reflex -a opencode -g -y 2>&1); then
+    msg "Skill agent-reflex installed through the skills CLI."
+  else
+    warn "Skill agent-reflex not installed — the skills CLI failed:"
+    printf '%s\n' "$output" | sed 's/^/  /'
+  fi
+}
+
 # ---------------------------------------------------------------
 # UPDATE MODE: an existing installation is only brought up to date.
 # ---------------------------------------------------------------
 if [ -f "$PLUGIN_DEST/index.ts" ] || { [ -n "$CONFIG_FILE" ] && grep -q 'plugins/reflex' "$CONFIG_FILE"; }; then
   update_files
+  install_skill
   msg "Existing installation detected — options left untouched."
   msg "Restart OpenCode ${BOLD}(opencode service restart)${RESET} to reload the plugin."
   exit 0
@@ -199,9 +246,10 @@ ask fallbackModel "${BOLD}Fallback classifier model on the same endpoint, retrie
 ask debugLog "${BOLD}Debug log file for outgoing request bodies${RESET} ${DIM}(optional, blank to skip)${RESET}: "
 
 # ---------------------------------------------------------------
-# Install the plugin files and merge the config entry.
+# Install the plugin files, the skill, and merge the config entry.
 # ---------------------------------------------------------------
 update_files
+install_skill
 
 make_entry() {
   PLUGIN_PROVIDER="$provider" \

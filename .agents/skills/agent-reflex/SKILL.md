@@ -9,10 +9,20 @@ An OpenCode plugin that adds a small System One decision model (Jev, nimble, d1,
 liquid-d1...) as a classifier to the agent loop. This skill briefs the user on
 its capabilities and installs or updates it.
 
-Paths below are relative to this skill's directory (the repo's
-`.opencode/skills/agent-reflex/`): the installer is at `../../../install.sh`,
-the README at `../../../README.md`, example configs at
-`../../../opencode.example.jsonc`, the source at `../../../plugins/reflex/index.ts`.
+## Locate the installer
+
+When this skill runs from the repository, the installer is at
+`../../../install.sh` relative to this skill's directory, the README at
+`../../../README.md`, example configs at `../../../opencode.example.jsonc`,
+the source at `../../../plugins/reflex/index.ts`.
+
+When this skill was installed standalone (e.g. via
+`npx skills add psygreg/agent-reflex`), the repository is not present: clone
+it first and use `<clone>/install.sh` instead:
+
+```sh
+git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
+```
 
 ## Capabilities (brief the user with this)
 
