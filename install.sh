@@ -7,16 +7,60 @@
 # installation (plugin copy or config entry) is detected and the configured
 # options are left untouched.
 #
-# Requires bash and, for the automatic config merge, bun (the plugin needs a
-# JS/TS runtime to load anyway). Without bun the plugin entry is printed for a
-# manual paste instead.
+# Requires bash and, for the automatic config merge, bun, node (bundled with
+# npm) or deno — the plugin needs a JS/TS runtime to load anyway. Without any
+# of them the plugin entry is printed for a manual paste instead.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_SRC="$REPO_DIR/plugins/reflex"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+
+# The global OpenCode config lives in ~/.config/opencode (XDG) or, with some
+# installation methods, ~/.opencode. An existing config file decides the
+# directory: the plugin entry's "./plugins/reflex" package path resolves
+# relative to the config file, so the plugin copy must live in the same
+# directory. A fresh install defaults to the XDG directory.
+XDG_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+CONFIG_DIR=""
+CONFIG_FILE=""
+for dir in "$XDG_CONFIG_DIR" "$HOME/.opencode"; do
+  for f in opencode.json opencode.jsonc; do
+    if [ -f "$dir/$f" ]; then
+      CONFIG_DIR="$dir"
+      CONFIG_FILE="$dir/$f"
+      break 2
+    fi
+  done
+done
+if [ -z "$CONFIG_DIR" ]; then
+  CONFIG_DIR="$XDG_CONFIG_DIR"
+fi
 PLUGIN_DEST="$CONFIG_DIR/plugins/reflex"
+
+# JS runtime used for the config merge, in order of preference. The merge
+# script is plain CommonJS, so bun, node (bundled with npm) and deno all run it.
+JS_RUNTIME=""
+if command -v bun >/dev/null 2>&1; then
+  JS_RUNTIME="bun -e"
+elif command -v node >/dev/null 2>&1; then
+  JS_RUNTIME="node -e"
+elif command -v deno >/dev/null 2>&1; then
+  JS_RUNTIME="deno eval"
+fi
+
+# Terminal colors, disabled when stdout is not a terminal or NO_COLOR is set
+# (https://no-color.org). Piped/non-interactive runs get plain text.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD=$'\e[1m' CYAN=$'\e[36m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RED=$'\e[31m' DIM=$'\e[2m' RESET=$'\e[0m'
+else
+  BOLD="" CYAN="" GREEN="" YELLOW="" RED="" DIM="" RESET=""
+fi
+
+msg() { echo "${BOLD}${CYAN}[agent-reflex]${RESET}: $*"; }
+warn() { echo "${BOLD}${YELLOW}[agent-reflex]${RESET}: ${BOLD}$*${RESET}"; }
+err() { echo "${BOLD}${RED}[agent-reflex]${RESET}: $*" >&2; }
+die() { err "${RED}$*${RESET}"; exit 1; }
 
 # Classifier presets: default base URL and suggested model per provider.
 declare -A PRESET_URL=(
@@ -47,19 +91,10 @@ declare -A PRESET_HINT=(
   [opencode]="jev-1.13, or the limited-time free jev-1.13-free"
 )
 
-# Pick the existing config file, or default to opencode.json for a fresh one.
-CONFIG_FILE=""
-for f in opencode.json opencode.jsonc; do
-  if [ -f "$CONFIG_DIR/$f" ]; then
-    CONFIG_FILE="$CONFIG_DIR/$f"
-    break
-  fi
-done
-
 update_files() {
   mkdir -p "$PLUGIN_DEST"
   cp "$PLUGIN_SRC"/*.ts "$PLUGIN_DEST"/
-  echo "[agent-reflex]: Plugin files updated in $PLUGIN_DEST"
+  msg "Plugin files updated in ${DIM}${PLUGIN_DEST}${RESET}"
 }
 
 # ---------------------------------------------------------------
@@ -67,8 +102,8 @@ update_files() {
 # ---------------------------------------------------------------
 if [ -f "$PLUGIN_DEST/index.ts" ] || { [ -n "$CONFIG_FILE" ] && grep -q 'plugins/reflex' "$CONFIG_FILE"; }; then
   update_files
-  echo "[agent-reflex]: Existing installation detected — options left untouched."
-  echo "[agent-reflex]: Restart OpenCode (opencode service restart) to reload the plugin."
+  msg "Existing installation detected — options left untouched."
+  msg "Restart OpenCode ${BOLD}(opencode service restart)${RESET} to reload the plugin."
   exit 0
 fi
 
@@ -76,36 +111,35 @@ fi
 # FRESH INSTALL: ask for the classifier options.
 # ---------------------------------------------------------------
 if [ ! -d "$PLUGIN_SRC" ]; then
-  echo "[agent-reflex]: plugins/reflex not found next to install.sh — run from the repository root." >&2
-  exit 1
+  die "plugins/reflex not found next to install.sh — run from the repository root."
 fi
 
-echo "agent-reflex setup — the plugin needs a System One decision model as its classifier."
-echo "It is asked through the System One endpoint at <baseURL>/systemone."
-echo
-
-echo "Which provider serves the classifier?"
-echo "  1) llamacpp    local llama.cpp server"
-echo "  2) ollama      local Ollama (0.35 onwards)"
 # Prompt helper: reads one line, applies DEFAULT when the line is empty, and
 # exits cleanly when stdin closes (EOF) instead of looping or aborting.
 ask() {
   local __var="$1" __prompt="$2" __default="${3-}" __val=""
   if ! read -r -p "$__prompt" __val; then
     echo >&2
-    echo "[agent-reflex]: No input available (stdin closed). Re-run and answer the prompts." >&2
+    err "No input available (stdin closed). Re-run and answer the prompts."
     exit 1
   fi
   printf -v "$__var" '%s' "${__val:-$__default}"
 }
 
-echo "  3) lmstudio    local LM Studio (0.4.26 onwards)"
-echo "  4) typesafe    TypeSafe API, Jev (api.typesafe.ai)"
-echo "  5) openrouter  OpenRouter"
-echo "  6) vercel      Vercel AI Gateway"
-echo "  7) opencode    OpenCode Zen"
-echo "  8) custom      any other System One endpoint"
-ask choice "Provider [1-8]: "
+echo "${BOLD}agent-reflex setup${RESET} — the plugin needs a ${CYAN}${BOLD}System One decision model${RESET} as its classifier."
+echo "It is asked through the System One endpoint at ${DIM}<baseURL>/systemone${RESET}."
+echo
+
+echo "${BOLD}Which provider serves the classifier?${RESET}"
+echo "  ${CYAN}1)${RESET} ${BOLD}llamacpp${RESET}    ${DIM}local llama.cpp server${RESET}"
+echo "  ${CYAN}2)${RESET} ${BOLD}ollama${RESET}      ${DIM}local Ollama (0.35 onwards)${RESET}"
+echo "  ${CYAN}3)${RESET} ${BOLD}lmstudio${RESET}    ${DIM}local LM Studio (0.4.26 onwards)${RESET}"
+echo "  ${CYAN}4)${RESET} ${BOLD}typesafe${RESET}    ${DIM}TypeSafe API, Jev (api.typesafe.ai)${RESET}"
+echo "  ${CYAN}5)${RESET} ${BOLD}openrouter${RESET}  ${DIM}OpenRouter${RESET}"
+echo "  ${CYAN}6)${RESET} ${BOLD}vercel${RESET}      ${DIM}Vercel AI Gateway${RESET}"
+echo "  ${CYAN}7)${RESET} ${BOLD}opencode${RESET}    ${DIM}OpenCode Zen${RESET}"
+echo "  ${CYAN}8)${RESET} ${BOLD}custom${RESET}      ${DIM}any other System One endpoint${RESET}"
+ask choice "${BOLD}Provider${RESET} ${DIM}[1-8]${RESET}: "
 case "$choice" in
   1) provider="llamacpp" ;;
   2) provider="ollama" ;;
@@ -115,23 +149,23 @@ case "$choice" in
   6) provider="vercel" ;;
   7) provider="opencode" ;;
   8) provider="custom" ;;
-  *) echo "Invalid choice." >&2; exit 1 ;;
+  *) die "Invalid choice." ;;
 esac
 
 baseURL=""
 case "$provider" in
   llamacpp|ollama|lmstudio)
-    ask local_yn "Server runs on this machine? [Y/n]: " "Y"
+    ask local_yn "${BOLD}Server runs on this machine?${RESET} ${DIM}[Y/n]${RESET}: " "Y"
     if [[ ! "$local_yn" =~ ^[nN] ]]; then
       baseURL="${PRESET_URL[$provider]}"
     else
-      ask baseURL "Base URL of the remote server, including /v1 (e.g. http://192.168.1.10:8080/v1): "
-      if [ -z "$baseURL" ]; then echo "A base URL is required for a remote server." >&2; exit 1; fi
+      ask baseURL "${BOLD}Base URL of the remote server, including /v1${RESET} ${DIM}(e.g. http://192.168.1.10:8080/v1)${RESET}: "
+      if [ -z "$baseURL" ]; then die "A base URL is required for a remote server."; fi
     fi
     ;;
   custom)
-    ask baseURL "Base URL of the System One endpoint, including /v1: "
-    if [ -z "$baseURL" ]; then echo "A base URL is required." >&2; exit 1; fi
+    ask baseURL "${BOLD}Base URL of the System One endpoint, including /v1${RESET}: "
+    if [ -z "$baseURL" ]; then die "A base URL is required."; fi
     ;;
   *)
     baseURL="${PRESET_URL[$provider]}"
@@ -140,29 +174,29 @@ esac
 
 model_default="${PRESET_MODEL[$provider]}"
 if [ -n "$model_default" ]; then
-  ask model "Classifier model [$model_default]: " "$model_default"
+  ask model "${BOLD}Classifier model${RESET} ${DIM}[${model_default}]${RESET}: " "$model_default"
 else
   while :; do
-    ask model "Classifier model (${PRESET_HINT[$provider]}): "
+    ask model "${BOLD}Classifier model${RESET} ${DIM}(${PRESET_HINT[$provider]})${RESET}: "
     [ -n "$model" ] && break
-    echo "The classifier model is required." >&2
+    err "The classifier model is required."
   done
 fi
 
 case "$provider" in
   llamacpp|ollama|lmstudio)
-    ask apiKey "API key for the server, if it requires one (optional, {env:NAME} supported): "
+    ask apiKey "${BOLD}API key for the server, if it requires one${RESET} ${DIM}(optional, {env:NAME} supported)${RESET}: "
     ;;
   *)
-    ask apiKey "API key ({env:NAME} supported, e.g. {env:TYPESAFE_API_KEY}): "
+    ask apiKey "${BOLD}API key${RESET} ${DIM}({env:NAME} supported, e.g. {env:TYPESAFE_API_KEY})${RESET}: "
     if [ -z "$apiKey" ]; then
-      echo "[agent-reflex]: No key given — $provider normally requires one; add \"apiKey\" later if calls fail."
+      warn "No key given — ${BOLD}${provider}${RESET} normally requires one; add ${BOLD}\"apiKey\"${RESET} later if calls fail."
     fi
     ;;
 esac
 
-ask fallbackModel "Fallback classifier model on the same endpoint, retried if the primary rejects requests (optional): "
-ask debugLog "Debug log file for outgoing request bodies (optional, blank to skip): "
+ask fallbackModel "${BOLD}Fallback classifier model on the same endpoint, retried if the primary rejects requests${RESET} ${DIM}(optional)${RESET}: "
+ask debugLog "${BOLD}Debug log file for outgoing request bodies${RESET} ${DIM}(optional, blank to skip)${RESET}: "
 
 # ---------------------------------------------------------------
 # Install the plugin files and merge the config entry.
@@ -177,7 +211,11 @@ make_entry() {
   PLUGIN_FALLBACK_MODEL="$fallbackModel" \
   PLUGIN_DEBUG_LOG="$debugLog" \
   CONFIG_FILE="$CONFIG_FILE" \
-  bun -e '
+  MSG_PREFIX="${BOLD}${CYAN}[agent-reflex]${RESET}: " \
+  MSG_ERROR_PREFIX="${BOLD}${RED}[agent-reflex]${RESET}: " \
+  $JS_RUNTIME '
+(async () => {
+    const fs = await import("node:fs");
     const options = {
       provider: process.env.PLUGIN_PROVIDER,
       ...(process.env.PLUGIN_BASEURL ? { baseURL: process.env.PLUGIN_BASEURL } : {}),
@@ -192,7 +230,6 @@ make_entry() {
       .split("\n").map((l) => "    " + l).join("\n");
 
     const path = process.env.CONFIG_FILE || "";
-    const fs = require("node:fs");
     let text = path && fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
 
     if (text.trim() === "") {
@@ -220,7 +257,7 @@ make_entry() {
         const trimmed = text.replace(/\s+$/, "");
         const lastBrace = trimmed.lastIndexOf("}");
         if (lastBrace === -1) {
-          console.error("[agent-reflex]: Config file has no closing brace — not a JSON object?");
+          console.error(`${process.env.MSG_ERROR_PREFIX}Config file has no closing brace — not a JSON object?`);
           process.exit(1);
         }
         const core = trimmed.slice(0, lastBrace).replace(/\s+$/, "");
@@ -257,31 +294,38 @@ make_entry() {
         JSON.parse(stripJsonc(fs.readFileSync(path, "utf8")));
       } catch (error) {
         fs.copyFileSync(path + ".agent-reflex.bak", path);
-        console.error(`[agent-reflex]: Merged config failed validation (${error.message}) — original restored, backup kept at ${path}.agent-reflex.bak`);
+        console.error(`${process.env.MSG_ERROR_PREFIX}Merged config failed validation (${error.message}) — original restored, backup kept at ${path}.agent-reflex.bak`);
         process.exit(1);
       }
     }
-    console.log(`[agent-reflex]: Plugin entry added to ${path || "(new config file)"}`);
+    console.log(`${process.env.MSG_PREFIX}Plugin entry added to ${path || "(new config file)"}`);
+})().catch((error) => {
+  console.error(`${process.env.MSG_ERROR_PREFIX}${(error && error.message) || error}`);
+  process.exit(1);
+});
   '
 }
 
 manual_entry() {
+  # Optional fields are built separately and printed with %b so their \n
+  # escapes are honored; printf arguments do not interpret escape sequences.
+  local opt_api="" opt_fallback="" opt_debug=""
+  [ -n "$apiKey" ] && opt_api=',\n      "apiKey": "'"$apiKey"'"'
+  [ -n "$fallbackModel" ] && opt_fallback=',\n      "fallbackModel": "'"$fallbackModel"'"'
+  [ -n "$debugLog" ] && opt_debug=',\n      "debugLog": "'"$debugLog"'"'
   echo
-  echo "[agent-reflex]: The config entry must be added by hand. Add this object to"
-  echo "the \"plugins\" array in ${CONFIG_FILE:-$CONFIG_DIR/opencode.json}"
-  echo "(create the file with { \"plugins\": [...] } if absent):"
+  warn "The config entry must be added by hand. Add this object to"
+  echo "the ${BOLD}\"plugins\"${RESET} array in ${DIM}${CONFIG_FILE:-$CONFIG_DIR/opencode.json}${RESET}"
+  echo "(create the file with { ${BOLD}\"plugins\"${RESET}: [...] } if absent):"
   echo
-  printf '  {\n    "package": "./plugins/reflex",\n    "options": {\n      "provider": "%s",\n      "baseURL": "%s",\n      "model": "%s"%s%s%s\n    }\n  }\n' \
-    "$provider" "$baseURL" "$model" \
-    "${apiKey:+,\n      \"apiKey\": \"$apiKey\"}" \
-    "${fallbackModel:+,\n      \"fallbackModel\": \"$fallbackModel\"}" \
-    "${debugLog:+,\n      \"debugLog\": \"$debugLog\"}"
+  printf '%s  {\n    "package": "./plugins/reflex",\n    "options": {\n      "provider": "%s",\n      "baseURL": "%s",\n      "model": "%s"%b%b%b\n    }\n  }\n%s' \
+    "$CYAN" "$provider" "$baseURL" "$model" "$opt_api" "$opt_fallback" "$opt_debug" "$RESET"
   echo
-  echo "[agent-reflex]: Then restart OpenCode (opencode service restart) to load the plugin."
+  msg "Then restart OpenCode ${BOLD}(opencode service restart)${RESET} to load the plugin."
 }
 
 merged=0
-if command -v bun >/dev/null 2>&1; then
+if [ -n "$JS_RUNTIME" ]; then
   if [ -z "$CONFIG_FILE" ]; then
     CONFIG_FILE="$CONFIG_DIR/opencode.json"
   fi
@@ -290,13 +334,13 @@ if command -v bun >/dev/null 2>&1; then
   fi
 else
   echo
-  echo "[agent-reflex]: bun not found — plugin files are installed, but the config"
-  echo "entry could not be merged automatically."
+  warn "No JS runtime found (bun, node or deno) — plugin files are installed,"
+  echo "but the config entry could not be merged automatically."
 fi
 
 if [ "$merged" = 1 ]; then
   echo
-  echo "[agent-reflex]: Installed. Restart OpenCode (opencode service restart) to load the plugin."
+  msg "${BOLD}${GREEN}Installed.${RESET} Restart OpenCode ${BOLD}(opencode service restart)${RESET} to load the plugin."
 else
   manual_entry
 fi
