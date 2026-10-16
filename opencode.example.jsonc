@@ -23,7 +23,7 @@
     // Classifier on a local llama.cpp server with the System One API (/systemone).
     // Main agent on Anthropic: effort goes to output_config.effort.
     {
-      "package": "./plugins/orchestrator",
+      "package": "./plugins/reflex",
       "options": {
         "provider": "llamacpp",
         "baseURL": "http://127.0.0.1:1123/v1",
@@ -36,7 +36,7 @@
     // Classifier on llama.cpp (OpenAI-compatible chat), main agent also on llama.cpp:
     // effort goes to chat_template_kwargs.enable_thinking (on / off only).
     // {
-    //   "package": "./plugins/orchestrator",
+    //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "llamacpp",
     //     "model": "liquid-d1",
@@ -49,7 +49,7 @@
     // Z.ai API, and to reasoning_effort alone through the OpenCode Go gateway
     // (opencode-go/glm-5.2, glm-5.3, glm-5.3-flash), detected from the request URL.
     // {
-    //   "package": "./plugins/orchestrator",
+    //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "llamacpp",
     //     "model": "liquid-d1",
@@ -61,7 +61,7 @@
     // Classifier on llama.cpp (System One API), main agent on an OpenAI GPT reasoning model
     // through either the OpenAI API or OpenCode Go. Effort is written in the endpoint's dialect.
     // {
-    //   "package": "./plugins/orchestrator",
+    //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "llamacpp",
     //     "model": "liquid-d1",
@@ -72,7 +72,7 @@
 
     // Ollama classifier. Effort is not wired for Ollama yet (see README).
     // {
-    //   "package": "./plugins/orchestrator",
+    //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "ollama",
     //     "model": "qwen2.5:3b"
@@ -81,7 +81,7 @@
 
     // LM Studio classifier. Effort is not wired for LM Studio yet (see README).
     // {
-    //   "package": "./plugins/orchestrator",
+    //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "lmstudio",
     //     "model": "qwen2.5-3b-instruct"
@@ -90,7 +90,7 @@
 
     // Remote OpenAI-compatible classifier with an API key from the environment.
     // {
-    //   "package": "./plugins/orchestrator",
+    //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "custom",
     //     "baseURL": "https://YOUR-PROVIDER-HOST/v1",

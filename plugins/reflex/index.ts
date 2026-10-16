@@ -324,7 +324,7 @@ async function findSyntaxErrors(filePath: string): Promise<string[] | null> {
 }
 
 export default Plugin.define({
-  id: "agent-orchestrator",
+  id: "agent-reflex",
 
   async setup(ctx) {
     const config = resolveConfig((ctx.options ?? {}) as Record<string, unknown>);
