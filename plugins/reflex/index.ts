@@ -122,6 +122,63 @@ function applyOpenAiLevel(body: any, level: EffortLevel, url: string): boolean {
   return false;
 }
 
+// Effort dialect detection is per request, from the model actually being requested.
+// The http.request hook event carries the provider's own model reference
+// (event.model), even when a gateway like OpenCode Go proxies many models
+// (Claude, GLM, GPT...) through a single server, so one model's dialect is
+// never injected into another model's request.
+
+// Claude models speak the Anthropic /v1/messages dialect (api.anthropic.com or
+// compatible gateways). Claude through a chat/completions endpoint stays untouched.
+function isAnthropicMessagesEndpoint(url: string): boolean {
+  const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  return /\/messages$/i.test(pathname);
+}
+
+// GPT reasoning models accept reasoning effort: gpt-5 onwards plus the o-series.
+const OPENAI_REASONING_MODEL = /(?:^|[/\-_.\s])(?:gpt-[5-9]|o[134])(?:[-_.\s]|$)/i;
+
+// chat_template_kwargs is a llama.cpp-server-only field, and llama.cpp servers run
+// on loopback or LAN hosts. A remote llama.cpp server loses effort control this
+// way, which is safer than injecting the field into a foreign endpoint.
+function isLocalLlamaCpp(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      host === "localhost" ||
+      host === "::1" ||
+      /^127\./.test(host) ||
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Decides which effort dialect a request speaks from the model being requested
+// (event.model, falling back to the request body's model field). Requests with
+// an unknown dialect stay untouched.
+function detectBackend(model: { providerID?: string; id?: string } | undefined, body: any, url: string): PrimaryBackend | null {
+  const modelId =
+    typeof model?.id === "string" && model.id
+      ? model.id
+      : typeof body?.model === "string"
+        ? body.model
+        : "";
+
+  // GLM models from 5.2 onwards, through the Z.ai API or the OpenCode Go gateway.
+  if (parseGlmModel(modelId)?.supportsEffort) return "zai";
+  // Claude models on a /v1/messages endpoint.
+  if (/claude/i.test(modelId)) return isAnthropicMessagesEndpoint(url) ? "anthropic" : null;
+  // GPT reasoning models through the OpenAI API or OpenCode Go.
+  if (OPENAI_REASONING_MODEL.test(modelId)) return "openai";
+  // llama.cpp servers on loopback or LAN hosts.
+  if (isLocalLlamaCpp(url)) return "llamacpp";
+  return null;
+}
+
 // Permission actions that carry a shell command.
 const SHELL_ACTIONS = new Set(["bash", "shell", "terminal"]);
 
@@ -140,7 +197,6 @@ interface SystemOneConfig {
   apiKey?: string;
   protocol: Protocol;
   debugLog?: string;
-  primaryBackend?: PrimaryBackend;
 }
 
 function resolveConfig(options: Record<string, unknown>): SystemOneConfig | null {
@@ -155,13 +211,6 @@ function resolveConfig(options: Record<string, unknown>): SystemOneConfig | null
     apiKey: options.apiKey as string | undefined,
     protocol: options.protocol === "systemone" ? "systemone" : "openai",
     debugLog: typeof options.debugLog === "string" ? options.debugLog : undefined,
-    primaryBackend:
-      options.primaryBackend === "anthropic" ||
-      options.primaryBackend === "llamacpp" ||
-      options.primaryBackend === "openai" ||
-      options.primaryBackend === "zai"
-        ? options.primaryBackend
-        : undefined,
   };
 }
 
@@ -333,6 +382,14 @@ export default Plugin.define({
       return;
     }
 
+    // DEPRECATED: "primaryBackend" no longer gates effort control. The dialect is
+    // detected per request from the model actually being requested, so every
+    // model gets its own effort fields automatically. The option is accepted
+    // for compatibility and has no effect.
+    if ("primaryBackend" in (ctx.options ?? {})) {
+      console.warn("[System One Orchestrator]: The 'primaryBackend' option is deprecated and has no effect. Effort control is now automatic for every model that supports it.");
+    }
+
     console.log(`[System One Orchestrator]: Initialized (${config.model} @ ${config.baseURL}), monitoring context...`);
 
     // Estado por sessão: complexidade da tarefa atual
@@ -426,41 +483,52 @@ export default Plugin.define({
     // ==========================================
     // HOOK 2: EFFORT ON EVERY PRIMARY REQUEST
     // Applies the session's level to each request body, including tool continuations.
+    // The dialect is detected per request from the model actually being requested
+    // (event.model), so every model gets only the fields its own API accepts —
+    // including when one gateway (OpenCode Go) proxies many models on one server.
+    // Requests that speak none of the supported dialects stay untouched.
     // ==========================================
-    if (config.primaryBackend) {
-      const backend = config.primaryBackend;
-      await ctx.session.hook("http.request", async (event) => {
-        if (event.kind !== "primary") return;
-        const level = levelBySession.get(event.sessionID);
-        if (!level) return;
+    await ctx.session.hook("http.request", async (event) => {
+      if (event.kind !== "primary") return;
+      const level = levelBySession.get(event.sessionID);
+      if (!level) return;
 
-        let body: any;
-        try {
-          body = JSON.parse(await event.request.clone().text());
-        } catch {
-          return;
-        }
+      let body: any;
+      try {
+        body = JSON.parse(await event.request.clone().text());
+      } catch {
+        return;
+      }
 
-        if (backend === "anthropic") {
+      const dialect = detectBackend(event.model, body, event.request.url);
+      if (!dialect) return;
+
+      try {
+        if (dialect === "anthropic") {
           body.output_config = { ...body.output_config, effort: LEVEL_REQUEST[level].effort };
-        } else if (backend === "openai") {
+        } else if (dialect === "openai") {
           if (!applyOpenAiLevel(body, level, event.request.url)) return;
-        } else if (backend === "zai") {
-          // GLM models from 5.2 onwards, through the Z.ai API or the OpenCode Go gateway.
+        } else if (dialect === "zai") {
           if (!applyZaiLevel(body, level, event.request.url)) return;
         } else {
           body.chat_template_kwargs = { ...body.chat_template_kwargs, enable_thinking: LEVEL_REQUEST[level].thinking };
         }
+      } catch (error: any) {
+        // The effort rewrite must never fail the primary request. A rejection by the
+        // remote API cannot be caught here, which is why a request is only rewritten
+        // after its dialect was confirmed.
+        console.warn(`[Effort Warning]: Skipped effort rewrite for ${event.request.url}: ${error.message}`);
+        return;
+      }
 
-        const headers = new Headers(event.request.headers);
-        headers.delete("content-length");
-        event.request = new Request(event.request.url, {
-          method: event.request.method,
-          headers,
-          body: JSON.stringify(body),
-        });
+      const headers = new Headers(event.request.headers);
+      headers.delete("content-length");
+      event.request = new Request(event.request.url, {
+        method: event.request.method,
+        headers,
+        body: JSON.stringify(body),
       });
-    }
+    });
 
     // ==========================================
     // DEBUG: LOG OUTGOING REQUEST BODY (enable with "debugLog" option)

@@ -9,65 +9,54 @@
     //   model          Classifier model ID. Required.
     //   apiKey         Optional Bearer token. Use "{env:NAME}" instead of a literal key.
     //   protocol       "openai" (default, /chat/completions) or "systemone" (/systemone endpoint).
-    //   primaryBackend Request format for the main agent model: "anthropic", "llamacpp", "openai" or "zai".
-    //                  Sets effort on every primary request. Omit to disable effort control.
-    //                  "openai" targets GPT reasoning models: reasoning.effort on Responses API
-    //                  (including OpenCode Go GPT endpoints) or reasoning_effort on Chat Completions.
-    //                  Use only with GPT models that support reasoning effort.
-    //                  "zai" targets GLM models from 5.2 onwards: thinking.type plus
-    //                  reasoning_effort on the Z.ai API, reasoning_effort alone on the
-    //                  OpenCode Go gateway (detected from the request URL). Non-GLM
-    //                  requests stay untouched.
+    //   primaryBackend DEPRECATED, no effect, accepted for compatibility. Effort
+    //                  control is now automatic: the effort dialect is detected
+    //                  per request from the model actually being requested, so
+    //                  every model gets only the fields its own API accepts —
+    //                  including when one gateway (OpenCode Go) proxies many
+    //                  models through one server.
+    //                  Claude models on /v1/messages endpoints get
+    //                  output_config.effort. GPT reasoning models (gpt-5 onwards
+    //                  and the o-series) get reasoning.effort on Responses API
+    //                  (including OpenCode Go GPT endpoints) or reasoning_effort
+    //                  on Chat Completions. GLM models from 5.2 onwards get
+    //                  thinking.type plus reasoning_effort on the Z.ai API, and
+    //                  reasoning_effort alone on the OpenCode Go gateway (detected
+    //                  from the request URL). llama.cpp servers on loopback or
+    //                  LAN hosts get chat_template_kwargs.enable_thinking (on/off).
+    //                  Requests that speak none of these dialects stay untouched.
     //   debugLog       Optional file path. Appends each primary request body after rewrites.
 
     // Classifier on a local llama.cpp server with the System One API (/systemone).
-    // Main agent on Anthropic: effort goes to output_config.effort.
+    // Effort control is automatic: every model that supports it gets effort written
+    // in its own dialect (see "primaryBackend" note above), so no backend option is
+    // needed for any of the examples below.
     {
       "package": "./plugins/reflex",
       "options": {
         "provider": "llamacpp",
         "baseURL": "http://127.0.0.1:1123/v1",
         "model": "liquid-d1",
-        "protocol": "systemone",
-        "primaryBackend": "anthropic"
+        "protocol": "systemone"
       }
     },
 
-    // Classifier on llama.cpp (OpenAI-compatible chat), main agent also on llama.cpp:
-    // effort goes to chat_template_kwargs.enable_thinking (on / off only).
-    // {
-    //   "package": "./plugins/reflex",
-    //   "options": {
-    //     "provider": "llamacpp",
-    //     "model": "liquid-d1",
-    //     "primaryBackend": "llamacpp"
-    //   }
-    // },
-
-    // Classifier on llama.cpp (System One API), main agent on a Z.ai GLM model
-    // (GLM-5.2 onwards): effort goes to thinking.type + reasoning_effort on the
-    // Z.ai API, and to reasoning_effort alone through the OpenCode Go gateway
-    // (opencode-go/glm-5.2, glm-5.3, glm-5.3-flash), detected from the request URL.
+    // Main agent on llama.cpp: chat_template_kwargs.enable_thinking (on / off only).
+    // Main agent on a Z.ai GLM model (GLM-5.2 onwards): thinking.type +
+    // reasoning_effort on the Z.ai API, reasoning_effort alone through the
+    // OpenCode Go gateway, detected per request.
+    // Main agent on an OpenAI GPT reasoning model: reasoning.effort on the
+    // Responses API or reasoning_effort on Chat Completions.
+    // Multimodel setups work without extra options: each model gets its own
+    // fields, so switching models mid-session never sends a foreign field.
     // {
     //   "package": "./plugins/reflex",
     //   "options": {
     //     "provider": "llamacpp",
     //     "model": "liquid-d1",
     //     "protocol": "systemone",
-    //     "primaryBackend": "zai"
-    //   }
-    // },
-
-    // Classifier on llama.cpp (System One API), main agent on an OpenAI GPT reasoning model
-    // through either the OpenAI API or OpenCode Go. Effort is written in the endpoint's dialect.
-    // {
-    //   "package": "./plugins/reflex",
-    //   "options": {
-    //     "provider": "llamacpp",
-    //     "model": "liquid-d1",
-    //     "protocol": "systemone",
-    //     "primaryBackend": "openai"
-    //   }
+    //     "primaryBackend": "anthropic" // DEPRECATED, no effect: kept only to
+    //   }                              // show that old configs still load.
     // },
 
     // Ollama classifier. Effort is not wired for Ollama yet (see README).
