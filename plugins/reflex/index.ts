@@ -1,12 +1,28 @@
 import { Plugin } from "@opencode/plugin";
 
-type ProviderPreset = "llamacpp" | "ollama" | "lmstudio" | "custom";
+type ProviderPreset =
+  | "llamacpp"
+  | "ollama"
+  | "lmstudio"
+  | "typesafe"
+  | "openrouter"
+  | "vercel"
+  | "opencode"
+  | "custom";
 
-// Default OpenAI-compatible endpoints for local runtimes.
-const LOCAL_PRESETS: Record<string, string | undefined> = {
+// Default base URLs per provider preset. Every preset below serves the same
+// System One request shape (model, state, questions) at <baseURL>/systemone:
+// the local runtimes' System One API, the TypeSafe API (Jev), OpenRouter's
+// System One surface, the Vercel AI Gateway's TypeSafe-compatible surface and
+// OpenCode Zen. "custom" (or an omitted preset) needs an explicit baseURL.
+const PRESET_BASE_URLS: Record<string, string | undefined> = {
   llamacpp: "http://127.0.0.1:8080/v1",
   ollama: "http://127.0.0.1:11434/v1",
   lmstudio: "http://127.0.0.1:1234/v1",
+  typesafe: "https://api.typesafe.ai/v1",
+  openrouter: "https://openrouter.ai/api/v1",
+  vercel: "https://ai-gateway.vercel.sh/typesafe/v1",
+  opencode: "https://opencode.ai/zen/v1",
 };
 
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -25,8 +41,8 @@ type EffortLevel = keyof typeof LEVEL_REQUEST;
 
 // Complexity score cut-offs: above 0.60 is medium, above 0.85 is high.
 function classifyComplexity(score: number): EffortLevel {
-  if (score > 0.85) return "high";
-  if (score > 0.60) return "medium";
+  if (score > 0.80) return "high";
+  if (score > 0.50) return "medium";
   return "simple";
 }
 
@@ -184,32 +200,31 @@ const SHELL_ACTIONS = new Set(["bash", "shell", "terminal"]);
 
 const CONFIDENCE_TOOL = "systemone_check_confidence";
 
-// "openai": any OpenAI-compatible chat endpoint (llama.cpp, Ollama, LM Studio, remote providers).
-// "systemone": the System One server's native /systemone endpoint (questions/answers API).
-type Protocol = "openai" | "systemone";
-
 // Backend of the main agent model, which decides the request field used for effort.
 type PrimaryBackend = "anthropic" | "llamacpp" | "openai" | "zai";
 
 interface SystemOneConfig {
   baseURL: string;
   model: string;
+  // Optional classifier fallback: retried once (same endpoint and key) when the
+  // primary model rejects the request, e.g. when a limited-time free model
+  // window closes.
+  fallbackModel?: string;
   apiKey?: string;
-  protocol: Protocol;
   debugLog?: string;
 }
 
 function resolveConfig(options: Record<string, unknown>): SystemOneConfig | null {
   const provider = (options.provider as ProviderPreset | undefined) ?? "custom";
-  const baseURL = (options.baseURL as string | undefined) ?? LOCAL_PRESETS[provider];
+  const baseURL = (options.baseURL as string | undefined) ?? PRESET_BASE_URLS[provider];
   const model = options.model as string | undefined;
   if (!baseURL || !model) return null;
 
   return {
     baseURL: baseURL.replace(/\/+$/, ""),
     model,
+    fallbackModel: typeof options.fallbackModel === "string" ? options.fallbackModel : undefined,
     apiKey: options.apiKey as string | undefined,
-    protocol: options.protocol === "systemone" ? "systemone" : "openai",
     debugLog: typeof options.debugLog === "string" ? options.debugLog : undefined,
   };
 }
@@ -225,65 +240,54 @@ function isStructuralMessage(msg: any): boolean {
   return Array.isArray(msg?.content) && msg.content.some((part: any) => part?.type && part.type !== "text");
 }
 
-// Asks a yes/no question to any OpenAI-compatible chat endpoint and returns P(YES) in [0, 1].
-// Returns null when the model gives no usable number.
-async function askProbability(config: SystemOneConfig, state: string, question: string): Promise<number | null> {
-  if (config.protocol === "systemone") return askSystemOne(config, state, question);
-
-  const response = await fetch(`${config.baseURL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(config.apiKey ? { "Authorization": `Bearer ${config.apiKey}` } : {}),
-    },
-    body: JSON.stringify({
-      model: config.model,
-      temperature: 0,
-      max_tokens: 16,
-      messages: [
-        {
-          role: "system",
-          content: "You are a binary classifier. Reply with ONLY a decimal number between 0 and 1: the probability that the answer to the question is YES. No words, no explanation.",
-        },
-        { role: "user", content: `Context:\n${state}\n\nQuestion: ${question}` },
-      ],
-    }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-
-  if (!response.ok) return null;
-
-  const data = (await response.json()) as any;
-  const text: string = data.choices?.[0]?.message?.content ?? "";
-  const visible = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
-  const match = visible.match(/\d*\.?\d+/);
-  if (!match) return null;
-
-  let value = parseFloat(match[0]);
-  if (value > 1 && value <= 100) value /= 100;
-  return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : null;
-}
-
+// Asks a yes/no question to a System One endpoint (the local runtimes' System One
+// API, the TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen — all
+// serve the same shape at <baseURL>/systemone) and returns P(YES) in [0, 1].
+// Returns null when the model gives no usable number. System One models return
+// typed decisions, never text, so every classifier request uses this shape.
+// When the primary model rejects the request (e.g. a limited-time free model
+// window closes) and a fallbackModel is configured, the question is retried
+// once on the same endpoint and key.
 async function askSystemOne(config: SystemOneConfig, state: string, question: string): Promise<number | null> {
-  const response = await fetch(`${config.baseURL}/systemone`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(config.apiKey ? { "Authorization": `Bearer ${config.apiKey}` } : {}),
-    },
-    body: JSON.stringify({
-      model: config.model,
-      state,
-      questions: { q: { type: "noul", instructions: question } },
-    }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
+  const ask = async (model: string): Promise<number | null> => {
+    const response = await fetch(`${config.baseURL}/systemone`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(config.apiKey ? { "Authorization": `Bearer ${config.apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model,
+        state,
+        questions: { q: { type: "noul", instructions: question } },
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
 
-  if (!response.ok) return null;
+    if (!response.ok) return null;
 
-  const data = (await response.json()) as any;
-  const value = Number(data.answers?.q?.noul);
-  return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : null;
+    const data = (await response.json()) as any;
+    const value = Number(data.answers?.q?.noul);
+    return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : null;
+  };
+
+  let answer: number | null;
+  try {
+    answer = await ask(config.model);
+  } catch {
+    answer = null;
+  }
+  if (answer !== null) return answer;
+
+  if (config.fallbackModel && config.fallbackModel !== config.model) {
+    console.warn(`[System One]: Classifier model "${config.model}" unavailable, retrying with "${config.fallbackModel}".`);
+    try {
+      return await ask(config.fallbackModel);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 const EDIT_TOOLS = new Set(["edit", "write"]);
@@ -382,11 +386,18 @@ export default Plugin.define({
       return;
     }
 
-    // DEPRECATED: "primaryBackend" no longer gates effort control. The dialect is
-    // detected per request from the model actually being requested, so every
-    // model gets its own effort fields automatically. The option is accepted
-    // for compatibility and has no effect.
-    if ("primaryBackend" in (ctx.options ?? {})) {
+    // DEPRECATED options, accepted for compatibility and ignored:
+    // - "protocol": the classifier is always asked through the System One shape
+    //   (model, state, questions) at <baseURL>/systemone, since System One
+    //   models return typed decisions, never text.
+    // - "primaryBackend": the effort dialect is detected per request from the
+    //   model actually being requested, so every model gets its own effort
+    //   fields automatically.
+    const deprecated = ctx.options ?? {};
+    if ("protocol" in deprecated) {
+      console.warn("[System One Orchestrator]: The 'protocol' option is deprecated and has no effect. The classifier is always asked through the System One endpoint (<baseURL>/systemone).");
+    }
+    if ("primaryBackend" in deprecated) {
       console.warn("[System One Orchestrator]: The 'primaryBackend' option is deprecated and has no effect. Effort control is now automatic for every model that supports it.");
     }
 
@@ -426,7 +437,7 @@ export default Plugin.define({
 
           try {
             // Decisão binária: preserva se a probabilidade de relevância for maior que 40%
-            const keepProbability = await askProbability(
+            const keepProbability = await askSystemOne(
               config,
               `Old history message:\n[${String(msg.role).toUpperCase()}]: ${msgContent}`,
               "Does this message contain architectural requirements, scope definitions or crucial rules the model needs to remember to code on?"
@@ -455,7 +466,7 @@ export default Plugin.define({
       if (!userPrompt || userPrompt.includes("[object Object]")) return;
 
       try {
-        const score = await askProbability(
+        const score = await askSystemOne(
           config,
           `User prompt: ${userPrompt.trim()}`,
           "Does this prompt require deep logic thinking, complex algorithms or mathematical/concurrence bugs?"
@@ -572,7 +583,7 @@ export default Plugin.define({
           const threshold = level === "simple" ? 0.75 : 0.85;
 
           try {
-            const confidence = await askProbability(
+            const confidence = await askSystemOne(
               config,
               `AI line of thought:\n${thought}`,
               "Does this line of thought seem direct, correct and without hesitation or redundant loops?"
@@ -618,7 +629,7 @@ export default Plugin.define({
       if (!commandText) return;
 
       try {
-        const dangerScore = await askProbability(
+        const dangerScore = await askSystemOne(
           config,
           `Command to be executed in terminal: ${commandText}`,
           "Determine if this command may damage system files, remove directories without backup or leak environment keys."
@@ -673,7 +684,7 @@ export default Plugin.define({
             const content = await readFile(filePath, "utf8");
             const edited = event.input?.newString ?? event.input?.content ?? event.args?.newString ?? event.args?.content;
             const excerpt = excerptAroundEdit(content, edited);
-            const bugScore = await askProbability(
+            const bugScore = await askSystemOne(
               config,
               `Excerpt of edited file ${filePath}. It contains only the edited code plus ${SEMANTIC_CHECK_CONTEXT_LINES} lines on each side, so code outside it is not shown:\n${excerpt}`,
               "Does this code contain a bug that would prevent it from running or produce a wrong result? Judge only the visible excerpt; do not assume bugs in code that is not shown."

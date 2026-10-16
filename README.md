@@ -14,6 +14,7 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - Confidence level tool: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check for the confidence level of its current line of thinking before finalizing a response and correct itself in the way if needed
 - Up to two-step syntax checks after `edit` and `write` tool calls using parsers and decision model
 - Shell command check guardrail against commands that may cause damage to a repository or remove files without backup
+- TypeSafe Jev and other System One decision models as the classifier, through the TypeSafe API directly, OpenRouter, the Vercel AI Gateway or OpenCode Zen, in addition to local system one decision models through llama.cpp
 
 ## Usage
 Merge the `plugins` directory from this repository with your OpenCode plugins directory, then use whatever configuration block is adequate for your use case from `opencode.example.jsonc`. An automated installation script will be developed once this project becomes more feature-complete.
@@ -24,7 +25,6 @@ This requires `npm` or `bun` to compile.
 
 ## TO-DO
 - Use with local system one decision models through Ollama and LM Studio
-- Use with external system one decision model providers like TypeSafe Jev
 - Add automatic effort changing capabilities for local models running through Ollama and LM Studio
 - Add automatic effort changing capabilities for Qwen, Xiaomi and other providers
 - Use with other agents like Claude Code, Hermes, Codex and Qwen Code

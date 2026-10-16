@@ -4,27 +4,27 @@
     // Pick ONE entry. "package" is resolved relative to the config file that declares it.
     //
     // Options:
-    //   provider       llamacpp | ollama | lmstudio | custom. Sets the default baseURL.
-    //   baseURL        OpenAI-compatible base URL. Overrides the provider default.
+    //   provider       llamacpp | ollama | lmstudio | typesafe | openrouter | vercel |
+    //                  opencode | custom. Sets the default baseURL. The System One
+    //                  presets below all serve the classifier at <baseURL>/systemone:
+    //                    typesafe   https://api.typesafe.ai/v1 (TypeSafe API, Jev,
+    //                               model like "jev-latest")
+    //                    openrouter https://openrouter.ai/api/v1 (model like
+    //                               "typesafe/jev-1.14" or "~typesafe/jev-latest")
+    //                    vercel    https://ai-gateway.vercel.sh/typesafe/v1
+    //                               (Vercel AI Gateway, model like "typesafe-ai/jev")
+    //                    opencode  https://opencode.ai/zen/v1 (OpenCode Zen, model
+    //                               like "jev-1.13" or "jev-1.13-free")
+    //   baseURL        Base URL of a System One endpoint. Overrides the provider
+    //                  default. The classifier is always asked through the System
+    //                  One shape (model, state, questions) at <baseURL>/systemone:
+    //                  System One models return typed decisions, never text.
     //   model          Classifier model ID. Required.
+    //   fallbackModel  Optional second classifier model on the same endpoint and
+    //                  key, retried once when the primary model rejects the
+    //                  request — e.g. when a limited-time free model window
+    //                  closes ("jev-1.13-free" falling back to "jev-1.13").
     //   apiKey         Optional Bearer token. Use "{env:NAME}" instead of a literal key.
-    //   protocol       "openai" (default, /chat/completions) or "systemone" (/systemone endpoint).
-    //   primaryBackend DEPRECATED, no effect, accepted for compatibility. Effort
-    //                  control is now automatic: the effort dialect is detected
-    //                  per request from the model actually being requested, so
-    //                  every model gets only the fields its own API accepts —
-    //                  including when one gateway (OpenCode Go) proxies many
-    //                  models through one server.
-    //                  Claude models on /v1/messages endpoints get
-    //                  output_config.effort. GPT reasoning models (gpt-5 onwards
-    //                  and the o-series) get reasoning.effort on Responses API
-    //                  (including OpenCode Go GPT endpoints) or reasoning_effort
-    //                  on Chat Completions. GLM models from 5.2 onwards get
-    //                  thinking.type plus reasoning_effort on the Z.ai API, and
-    //                  reasoning_effort alone on the OpenCode Go gateway (detected
-    //                  from the request URL). llama.cpp servers on loopback or
-    //                  LAN hosts get chat_template_kwargs.enable_thinking (on/off).
-    //                  Requests that speak none of these dialects stay untouched.
     //   debugLog       Optional file path. Appends each primary request body after rewrites.
 
     // Classifier on a local llama.cpp server with the System One API (/systemone).
@@ -36,8 +36,7 @@
       "options": {
         "provider": "llamacpp",
         "baseURL": "http://127.0.0.1:1123/v1",
-        "model": "liquid-d1",
-        "protocol": "systemone"
+        "model": "liquid-d1"
       }
     },
 
@@ -54,12 +53,57 @@
     //   "options": {
     //     "provider": "llamacpp",
     //     "model": "liquid-d1",
-    //     "protocol": "systemone",
-    //     "primaryBackend": "anthropic" // DEPRECATED, no effect: kept only to
-    //   }                              // show that old configs still load.
+    //   }
     // },
 
-    // Ollama classifier. Effort is not wired for Ollama yet (see README).
+    // Classifier on Jev, TypeSafe AI's System One decision model, through the
+    // TypeSafe API directly. Model IDs like "jev-latest" or a pinned release.
+    // {
+    //   "package": "./plugins/reflex",
+    //   "options": {
+    //     "provider": "typesafe",
+    //     "model": "jev-latest",
+    //     "apiKey": "{env:TYPESAFE_API_KEY}"
+    //   }
+    // },
+
+    // Classifier on Jev through OpenRouter (same OpenRouter API key as the
+    // Decisions API). Model IDs like "typesafe/jev-1.14" or "~typesafe/jev-latest".
+    // {
+    //   "package": "./plugins/reflex",
+    //   "options": {
+    //     "provider": "openrouter",
+    //     "model": "~typesafe/jev-latest",
+    //     "apiKey": "{env:OPENROUTER_API_KEY}"
+    //   }
+    // },
+
+    // Classifier on Jev through the Vercel AI Gateway (TypeSafe-compatible
+    // surface). Model IDs like "typesafe-ai/jev".
+    // {
+    //   "package": "./plugins/reflex",
+    //   "options": {
+    //     "provider": "vercel",
+    //     "model": "typesafe-ai/jev",
+    //     "apiKey": "{env:AI_GATEWAY_API_KEY}"
+    //   }
+    // },
+
+    // Classifier on the limited-time free Jev on OpenCode Zen, falling back to
+    // the paid twin automatically when the free window closes. Model IDs like
+    // "jev-1.13" (paid), "jev-1.13-free" (limited-time free).
+    // {
+    //   "package": "./plugins/reflex",
+    //   "options": {
+    //     "provider": "opencode",
+    //     "model": "jev-1.13-free",
+    //     "fallbackModel": "jev-1.13",
+    //     "apiKey": "{env:OPENCODE_ZEN_API_KEY}"
+    //   }
+    // },
+
+    // Ollama classifier. The classifier endpoint is not wired for Ollama yet
+    // (see README); the effort hooks still work once the endpoint is available.
     // {
     //   "package": "./plugins/reflex",
     //   "options": {
@@ -68,7 +112,9 @@
     //   }
     // },
 
-    // LM Studio classifier. Effort is not wired for LM Studio yet (see README).
+    // LM Studio classifier. The classifier endpoint is not wired for LM Studio
+    // yet (see README); the effort hooks still work once the endpoint is
+    // available.
     // {
     //   "package": "./plugins/reflex",
     //   "options": {
@@ -77,7 +123,9 @@
     //   }
     // },
 
-    // Remote OpenAI-compatible classifier with an API key from the environment.
+    // Custom remote System One endpoint (any server serving the System One shape
+    // at <baseURL>/systemone, e.g. a TypeSafe-compatible re-host) with an API
+    // key from the environment.
     // {
     //   "package": "./plugins/reflex",
     //   "options": {
