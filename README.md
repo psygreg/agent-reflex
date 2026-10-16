@@ -8,6 +8,7 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 
 ### What works
 - Local system one decision models through llama.cpp
+- Use with OpenCode agent
 - Decision-driven history compaction
 - Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic or llama.cpp models (for now) in accordance
 - Confidence level tool: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check for the confidence level of its current line of thinking before finalizing a response and correct itself in the way if needed
