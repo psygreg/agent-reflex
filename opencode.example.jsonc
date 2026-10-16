@@ -47,7 +47,14 @@
       }
     },
 
-    // Main agent on llama.cpp: chat_template_kwargs.enable_thinking (on / off only).
+    // Main agent on a local llama.cpp or Ollama server (identified once per
+    // origin via /v1/models): top-level reasoning_effort, "low" keeping
+    // thinking at its lowest level and "medium"/"high" scaling it
+    // (model-defined names and compatibility aliases on Ollama); llama.cpp
+    // additionally gets chat_template_kwargs.enable_thinking for Qwen-style
+    // on/off templates.
+    // Main agent on LM Studio: no reasoning field is documented on its
+    // OpenAI-compatible endpoint yet, so those requests stay untouched.
     // Main agent on a Z.ai GLM model (GLM-5.2 onwards): thinking.type +
     // reasoning_effort on the Z.ai API, reasoning_effort alone through the
     // OpenCode Go gateway, detected per request.

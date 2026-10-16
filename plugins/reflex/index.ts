@@ -30,7 +30,10 @@ const PRESET_BASE_URLS: Record<string, string | undefined> = {
 const REQUEST_TIMEOUT_MS = 20_000;
 
 // Requested settings per complexity level.
-// effort: Anthropic output_config.effort. thinking: llama.cpp chat template enable_thinking (no levels there).
+// effort: Anthropic output_config.effort; OpenAI Responses reasoning.effort /
+// Chat Completions reasoning_effort; local reasoning_effort ("low" keeps
+// thinking at its lowest level).
+// thinking: llama.cpp chat template enable_thinking (on/off, Qwen-style templates).
 // maxTokens: level cap on generated tokens, sent through event.options (ignored by the
 // OpenCode Go provider) and enforced on the wire for Z.ai GLM (max_completion_tokens).
 const LEVEL_REQUEST = {
@@ -156,10 +159,15 @@ function isAnthropicMessagesEndpoint(url: string): boolean {
 // GPT reasoning models accept reasoning effort: gpt-5 onwards plus the o-series.
 const OPENAI_REASONING_MODEL = /(?:^|[/\-_.\s])(?:gpt-[5-9]|o[134])(?:[-_.\s]|$)/i;
 
-// chat_template_kwargs is a llama.cpp-server-only field, and llama.cpp servers run
-// on loopback or LAN hosts. A remote llama.cpp server loses effort control this
-// way, which is safer than injecting the field into a foreign endpoint.
-function isLocalLlamaCpp(url: string): boolean {
+// Local inference servers (llama.cpp, Ollama, LM Studio...) run on loopback or
+// LAN hosts. The kind of server is identified once per origin via GET /v1/models
+// (data[].owned_by): "llamacpp" for llama.cpp, "library" (the default Ollama
+// username) or "ollama" for Ollama, and "lmstudio"/"organization_owner" for
+// LM Studio. A probe that fails is cached as null (unknown) and retried only
+// after the plugin reloads.
+type LocalServer = "llamacpp" | "ollama" | "lmstudio";
+
+function isLocalHost(url: string): boolean {
   try {
     const host = new URL(url).hostname.toLowerCase();
     return (
@@ -175,10 +183,53 @@ function isLocalLlamaCpp(url: string): boolean {
   }
 }
 
+const localServerByOrigin = new Map<string, Promise<LocalServer | null>>();
+
+function detectLocalServer(url: string): Promise<LocalServer | null> {
+  let origin: string;
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    return Promise.resolve(null);
+  }
+
+  let probe = localServerByOrigin.get(origin);
+  if (!probe) {
+    probe = (async () => {
+      try {
+        const response = await fetch(`${origin}/v1/models`, { signal: AbortSignal.timeout(2_000) });
+        if (!response.ok) return null;
+        const owners: string[] = (((await response.json()) as any)?.data ?? []).map((m: any) =>
+          String(m?.owned_by ?? "")
+        );
+        if (owners.includes("llamacpp")) return "llamacpp";
+        if (owners.includes("lmstudio") || owners.includes("organization_owner")) return "lmstudio";
+        if (owners.some((owner) => owner === "library" || owner === "ollama")) return "ollama";
+        return null;
+      } catch {
+        return null;
+      }
+    })();
+    localServerByOrigin.set(origin, probe);
+  }
+  return probe;
+}
+
+// Reasoning effort written to local llama.cpp and Ollama requests. Both runtimes
+// accept top-level reasoning_effort on /v1/chat/completions: "low" keeps
+// thinking on at its lowest level, and "medium"/"high" scale it (the level
+// reaches the chat template on llama.cpp and is mapped per model on Ollama).
+const LOCAL_EFFORT = {
+  simple: "low",
+  medium: "medium",
+  high: "high",
+} as const;
+
 // Decides which effort dialect a request speaks from the model being requested
 // (event.model, falling back to the request body's model field). Requests with
-// an unknown dialect stay untouched.
-function detectBackend(model: { providerID?: string; id?: string } | undefined, body: any, url: string): PrimaryBackend | null {
+// an unknown dialect stay untouched. "local": a local inference server on a
+// loopback or LAN host, whose kind (llama.cpp or Ollama) is probed separately.
+function detectBackend(model: { providerID?: string; id?: string } | undefined, body: any, url: string): EffortDialect | null {
   const modelId =
     typeof model?.id === "string" && model.id
       ? model.id
@@ -192,8 +243,8 @@ function detectBackend(model: { providerID?: string; id?: string } | undefined, 
   if (/claude/i.test(modelId)) return isAnthropicMessagesEndpoint(url) ? "anthropic" : null;
   // GPT reasoning models through the OpenAI API or OpenCode Go.
   if (OPENAI_REASONING_MODEL.test(modelId)) return "openai";
-  // llama.cpp servers on loopback or LAN hosts.
-  if (isLocalLlamaCpp(url)) return "llamacpp";
+  // Local inference servers (llama.cpp, Ollama) on loopback or LAN hosts.
+  if (isLocalHost(url)) return "local";
   return null;
 }
 
@@ -202,8 +253,10 @@ const SHELL_ACTIONS = new Set(["bash", "shell", "terminal"]);
 
 const CONFIDENCE_TOOL = "systemone_check_confidence";
 
-// Backend of the main agent model, which decides the request field used for effort.
-type PrimaryBackend = "anthropic" | "llamacpp" | "openai" | "zai";
+// Effort dialect a primary request may speak, decided per request from the model
+// being requested. "local": a local inference server (llama.cpp or Ollama) on a
+// loopback or LAN host.
+type EffortDialect = "anthropic" | "openai" | "zai" | "local";
 
 interface SystemOneConfig {
   baseURL: string;
@@ -524,7 +577,25 @@ export default Plugin.define({
         } else if (dialect === "zai") {
           if (!applyZaiLevel(body, level, event.request.url)) return;
         } else {
-          body.chat_template_kwargs = { ...body.chat_template_kwargs, enable_thinking: LEVEL_REQUEST[level].thinking };
+          // Local inference server, its kind probed once per origin.
+          // Ollama and llama.cpp both take top-level reasoning_effort on
+          // /v1/chat/completions (levels scale thinking, with model-defined
+          // names and compatibility aliases on Ollama); llama.cpp additionally
+          // takes chat_template_kwargs for Qwen-style on/off templates while
+          // reasoning_effort covers gpt-oss-style ones. LM Studio's
+          // OpenAI-compatible endpoint documents no reasoning field, so its
+          // requests stay untouched.
+          const pathname = event.request.url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+          if (!/\/chat\/completions$/i.test(pathname)) return;
+          const server = await detectLocalServer(event.request.url);
+          if (!server || server === "lmstudio") return;
+          if (server === "llamacpp") {
+            body.chat_template_kwargs = {
+              ...body.chat_template_kwargs,
+              enable_thinking: LEVEL_REQUEST[level].thinking,
+            };
+          }
+          body.reasoning_effort = LOCAL_EFFORT[level];
         }
       } catch (error: any) {
         // The effort rewrite must never fail the primary request. A rejection by the

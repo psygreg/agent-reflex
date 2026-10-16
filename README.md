@@ -10,7 +10,7 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - Local system one decision models through llama.cpp (0.6 onwards), Ollama (0.35 onwards) and LM Studio (0.4.26 onwards), all serving the same System One endpoint at `<baseURL>/systemone`
 - Use with OpenCode v2 agent
 - Decision-driven history compaction
-- Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp, OpenAI GPT reasoning models, and Z.ai GLM models (GLM-5.2 onwards) in accordance. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin
+- Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp, Ollama, OpenAI GPT reasoning models, and Z.ai GLM models (GLM-5.2 onwards) in accordance. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin
 - Confidence level tool: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check for the confidence level of its current line of thinking before finalizing a response and correct itself in the way if needed
 - Up to two-step syntax checks after `edit` and `write` tool calls using parsers and decision model
 - Shell command check guardrail against commands that may cause damage to a repository or remove files without backup
@@ -24,6 +24,6 @@ For development, add a `"debugLog":` key to the plugin's options pointing to a f
 This requires `npm` or `bun` to compile.
 
 ## TO-DO
-- Add automatic effort changing capabilities for local models running through Ollama and LM Studio
+- Add automatic effort changing capabilities for local models running through LM Studio (blocked upstream: its OpenAI-compatible endpoint documents no reasoning field yet)
 - Add automatic effort changing capabilities for Qwen, Xiaomi and other providers
 - Use with other agents like Claude Code, Hermes, Codex and Qwen Code
