@@ -212,6 +212,92 @@ async function askSystemOne(config: SystemOneConfig, state: string, question: st
   return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : null;
 }
 
+const EDIT_TOOLS = new Set(["edit", "write"]);
+
+// The System One bug check runs only on medium and high complexity sessions, on the lines around the edit.
+const SEMANTIC_CHECK_CONFIDENCE = 0.75;
+const SEMANTIC_CHECK_CONTEXT_LINES = 40;
+const SEMANTIC_CHECK_MAX_CHARS = 8_000;
+
+// Returns the lines around the edited text, or the start of the file when the edit cannot be located.
+function excerptAroundEdit(content: string, edited: unknown): string {
+  const fallback = content.slice(0, SEMANTIC_CHECK_MAX_CHARS);
+  if (typeof edited !== "string" || edited.length === 0) return fallback;
+
+  const index = content.indexOf(edited);
+  if (index === -1) return fallback;
+
+  const lines = content.split("\n");
+  const first = content.slice(0, index).split("\n").length - 1;
+  const last = first + edited.split("\n").length - 1;
+  const from = Math.max(0, first - SEMANTIC_CHECK_CONTEXT_LINES);
+  const to = Math.min(lines.length, last + SEMANTIC_CHECK_CONTEXT_LINES + 1);
+
+  return lines.slice(from, to).join("\n").slice(0, SEMANTIC_CHECK_MAX_CHARS);
+}
+
+const TS_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+
+// Command-line syntax checks: the file path is appended to the arguments.
+const COMMAND_PARSERS: Record<string, [string, string[]]> = {
+  ".sh": ["bash", ["-n"]],
+  ".bash": ["bash", ["-n"]],
+  ".zsh": ["zsh", ["-n"]],
+  ".py": ["python3", ["-m", "py_compile"]],
+  ".rb": ["ruby", ["-c"]],
+  ".php": ["php", ["-l"]],
+  ".pl": ["perl", ["-c"]],
+  ".lua": ["luac", ["-p"]],
+  ".go": ["gofmt", ["-e"]],
+};
+
+// Runs a parser and returns its error lines. Returns null when the parser is not installed.
+async function runParser(command: string, args: string[]): Promise<string[] | null> {
+  const { execFile } = await import("node:child_process");
+  return new Promise((done) => {
+    execFile(command, args, (error, stdout, stderr) => {
+      if (!error) return done([]);
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return done(null);
+      done(String(stderr || stdout || error.message).trim().split("\n").slice(-5));
+    });
+  });
+}
+
+// Returns syntax errors for the file, an empty list when it parses, or null when no parser covers its type.
+async function findSyntaxErrors(filePath: string): Promise<string[] | null> {
+  const { extname } = await import("node:path");
+  const { readFile } = await import("node:fs/promises");
+  const ext = extname(filePath).toLowerCase();
+
+  if (TS_EXTENSIONS.has(ext)) {
+    const ts: any = await import("typescript");
+    const code = await readFile(filePath, "utf8");
+    const result = ts.transpileModule(code, { fileName: filePath, reportDiagnostics: true });
+    return (result.diagnostics ?? []).map((d: any) => {
+      const message = ts.flattenDiagnosticMessageText(d.messageText, "\n");
+      if (d.file && d.start !== undefined) {
+        const { line } = d.file.getLineAndCharacterOfPosition(d.start);
+        return `line ${line + 1}: ${message}`;
+      }
+      return message;
+    });
+  }
+
+  if (ext === ".json") {
+    try {
+      JSON.parse(await readFile(filePath, "utf8"));
+      return [];
+    } catch (error: any) {
+      return [error.message];
+    }
+  }
+
+  const parser = COMMAND_PARSERS[ext];
+  if (!parser) return null;
+  const [command, args] = parser;
+  return runParser(command, [...args, filePath]);
+}
+
 export default Plugin.define({
   id: "agent-orchestrator",
 
@@ -226,6 +312,9 @@ export default Plugin.define({
 
     // Estado por sessão: complexidade da tarefa atual
     const levelBySession = new Map<string, EffortLevel>();
+
+    // Consecutive failed checks per session and file. Reset when a check passes.
+    const failuresByFile = new Map<string, number>();
 
     // ==========================================
     // HOOK 1: CONTEXT (COMPACTION + PARAMETERS + SUGGESTION)
@@ -451,6 +540,78 @@ export default Plugin.define({
         }
       } catch (error: any) {
         console.warn(`[Guardrail Warning]: Failed to check command safety: ${error.message}`);
+      }
+    });
+
+    // ==========================================
+    // HOOK 4: SYNTAX CHECK AFTER EDITS
+    // Reports parser errors back to the agent so it can fix them on the next turn.
+    // ==========================================
+    await ctx.tool.hook("execute.after", async (event: any) => {
+      if (event.status !== "completed" || !EDIT_TOOLS.has(event.tool)) return;
+
+      const rawPath = event.input?.filePath ?? event.args?.filePath;
+      if (typeof rawPath !== "string" || !rawPath) return;
+
+      const filePath = rawPath.startsWith("/") ? rawPath : `${ctx.location.directory}/${rawPath}`;
+
+      try {
+        let errors: string[] = [];
+        try {
+          errors = (await findSyntaxErrors(filePath)) ?? [];
+        } catch (error: any) {
+          console.warn(`[Syntax Check Warning]: Parser failed for ${filePath}: ${error.message}`);
+        }
+        const notes: string[] = [];
+
+        if (errors.length > 0) {
+          notes.push(
+            `[Syntax check]: ${filePath} has ${errors.length} syntax error(s). Fix them before continuing:\n` +
+              errors.map((e) => `- ${e}`).join("\n")
+          );
+        } else {
+          const sessionID: string | undefined = event.sessionID ?? event.context?.sessionID;
+          const level = sessionID ? levelBySession.get(sessionID) : undefined;
+
+          if (level === "medium" || level === "high") {
+            const { readFile } = await import("node:fs/promises");
+            const content = await readFile(filePath, "utf8");
+            const edited = event.input?.newString ?? event.input?.content ?? event.args?.newString ?? event.args?.content;
+            const excerpt = excerptAroundEdit(content, edited);
+            const bugScore = await askProbability(
+              config,
+              `Excerpt of edited file ${filePath}. It contains only the edited code plus ${SEMANTIC_CHECK_CONTEXT_LINES} lines on each side, so code outside it is not shown:\n${excerpt}`,
+              "Does this code contain a bug that would prevent it from running or produce a wrong result? Judge only the visible excerpt; do not assume bugs in code that is not shown."
+            );
+            const correctness = bugScore === null ? null : 1 - bugScore;
+            if (correctness !== null && correctness < SEMANTIC_CHECK_CONFIDENCE) {
+              notes.push(
+                `[System One check]: The edit to ${filePath} is only ${(correctness * 100).toFixed(0)}% confident to be correct (threshold ${SEMANTIC_CHECK_CONFIDENCE * 100}%). Review it before continuing.`
+              );
+            }
+          }
+        }
+
+        const key = `${event.sessionID ?? ""}:${filePath}`;
+        if (notes.length === 0) {
+          failuresByFile.delete(key);
+          return;
+        }
+
+        const failures = (failuresByFile.get(key) ?? 0) + 1;
+        if (failures === 1) {
+          failuresByFile.set(key, failures);
+          notes.push("Retry once: fix the problem above, then edit the file again.");
+        } else {
+          failuresByFile.delete(key);
+          notes.push("The check still fails after one retry. Stop and ask the user how to proceed before editing this file again.");
+        }
+
+        if (typeof event.result?.content === "string") {
+          event.result = { ...event.result, content: event.result.content + "\n\n" + notes.join("\n\n") };
+        }
+      } catch (error: any) {
+        console.warn(`[Syntax Check Warning]: Skipped ${filePath}: ${error.message}`);
       }
     });
   }
