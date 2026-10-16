@@ -1,0 +1,69 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    // Pick ONE entry. "package" is resolved relative to the config file that declares it.
+    //
+    // Options:
+    //   provider       llamacpp | ollama | lmstudio | custom. Sets the default baseURL.
+    //   baseURL        OpenAI-compatible base URL. Overrides the provider default.
+    //   model          Classifier model ID. Required.
+    //   apiKey         Optional Bearer token. Use "{env:NAME}" instead of a literal key.
+    //   protocol       "openai" (default, /chat/completions) or "systemone" (/systemone endpoint).
+    //   primaryBackend Request format for the main agent model: "anthropic" or "llamacpp".
+    //                  Sets effort on every primary request. Omit to disable effort control.
+    //   debugLog       Optional file path. Appends each primary request body after rewrites.
+
+    // Classifier on a local llama.cpp server with the System One API (/systemone).
+    // Main agent on Anthropic: effort goes to output_config.effort.
+    {
+      "package": "./plugins/orchestrator",
+      "options": {
+        "provider": "llamacpp",
+        "baseURL": "http://127.0.0.1:1123/v1",
+        "model": "liquid-d1",
+        "protocol": "systemone",
+        "primaryBackend": "anthropic"
+      }
+    },
+
+    // Classifier on llama.cpp (OpenAI-compatible chat), main agent also on llama.cpp:
+    // effort goes to chat_template_kwargs.enable_thinking (on / off only).
+    // {
+    //   "package": "./plugins/orchestrator",
+    //   "options": {
+    //     "provider": "llamacpp",
+    //     "model": "liquid-d1",
+    //     "primaryBackend": "llamacpp"
+    //   }
+    // },
+
+    // Ollama classifier. Effort is not wired for Ollama yet (see README).
+    // {
+    //   "package": "./plugins/orchestrator",
+    //   "options": {
+    //     "provider": "ollama",
+    //     "model": "qwen2.5:3b"
+    //   }
+    // },
+
+    // LM Studio classifier. Effort is not wired for LM Studio yet (see README).
+    // {
+    //   "package": "./plugins/orchestrator",
+    //   "options": {
+    //     "provider": "lmstudio",
+    //     "model": "qwen2.5-3b-instruct"
+    //   }
+    // },
+
+    // Remote OpenAI-compatible classifier with an API key from the environment.
+    // {
+    //   "package": "./plugins/orchestrator",
+    //   "options": {
+    //     "provider": "custom",
+    //     "baseURL": "https://YOUR-PROVIDER-HOST/v1",
+    //     "model": "YOUR-MODEL-ID",
+    //     "apiKey": "{env:SYSTEMONE_API_KEY}"
+    //   }
+    // }
+  ]
+}
