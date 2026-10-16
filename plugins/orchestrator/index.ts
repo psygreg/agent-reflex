@@ -100,6 +100,28 @@ function applyZaiLevel(body: any, level: EffortLevel, url: string): boolean {
   return true;
 }
 
+// Applies the session's level to OpenAI GPT reasoning requests. OpenAI's
+// Responses API uses reasoning.effort; Chat Completions uses reasoning_effort.
+function applyOpenAiLevel(body: any, level: EffortLevel, url: string): boolean {
+  const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  const effort = LEVEL_REQUEST[level].effort;
+
+  if (/\/responses$/i.test(pathname)) {
+    body.reasoning = {
+      ...(body.reasoning && typeof body.reasoning === "object" ? body.reasoning : {}),
+      effort,
+    };
+    return true;
+  }
+
+  if (/\/chat\/completions$/i.test(pathname)) {
+    body.reasoning_effort = effort;
+    return true;
+  }
+
+  return false;
+}
+
 // Permission actions that carry a shell command.
 const SHELL_ACTIONS = new Set(["bash", "shell", "terminal"]);
 
@@ -110,7 +132,7 @@ const CONFIDENCE_TOOL = "systemone_check_confidence";
 type Protocol = "openai" | "systemone";
 
 // Backend of the main agent model, which decides the request field used for effort.
-type PrimaryBackend = "anthropic" | "llamacpp" | "zai";
+type PrimaryBackend = "anthropic" | "llamacpp" | "openai" | "zai";
 
 interface SystemOneConfig {
   baseURL: string;
@@ -134,7 +156,10 @@ function resolveConfig(options: Record<string, unknown>): SystemOneConfig | null
     protocol: options.protocol === "systemone" ? "systemone" : "openai",
     debugLog: typeof options.debugLog === "string" ? options.debugLog : undefined,
     primaryBackend:
-      options.primaryBackend === "anthropic" || options.primaryBackend === "llamacpp" || options.primaryBackend === "zai"
+      options.primaryBackend === "anthropic" ||
+      options.primaryBackend === "llamacpp" ||
+      options.primaryBackend === "openai" ||
+      options.primaryBackend === "zai"
         ? options.primaryBackend
         : undefined,
   };
@@ -418,6 +443,8 @@ export default Plugin.define({
 
         if (backend === "anthropic") {
           body.output_config = { ...body.output_config, effort: LEVEL_REQUEST[level].effort };
+        } else if (backend === "openai") {
+          if (!applyOpenAiLevel(body, level, event.request.url)) return;
         } else if (backend === "zai") {
           // GLM models from 5.2 onwards, through the Z.ai API or the OpenCode Go gateway.
           if (!applyZaiLevel(body, level, event.request.url)) return;

@@ -9,8 +9,11 @@
     //   model          Classifier model ID. Required.
     //   apiKey         Optional Bearer token. Use "{env:NAME}" instead of a literal key.
     //   protocol       "openai" (default, /chat/completions) or "systemone" (/systemone endpoint).
-    //   primaryBackend Request format for the main agent model: "anthropic", "llamacpp" or "zai".
+    //   primaryBackend Request format for the main agent model: "anthropic", "llamacpp", "openai" or "zai".
     //                  Sets effort on every primary request. Omit to disable effort control.
+    //                  "openai" targets GPT reasoning models: reasoning.effort on Responses API
+    //                  (including OpenCode Go GPT endpoints) or reasoning_effort on Chat Completions.
+    //                  Use only with GPT models that support reasoning effort.
     //                  "zai" targets GLM models from 5.2 onwards: thinking.type plus
     //                  reasoning_effort on the Z.ai API, reasoning_effort alone on the
     //                  OpenCode Go gateway (detected from the request URL). Non-GLM
@@ -52,6 +55,18 @@
     //     "model": "liquid-d1",
     //     "protocol": "systemone",
     //     "primaryBackend": "zai"
+    //   }
+    // },
+
+    // Classifier on llama.cpp (System One API), main agent on an OpenAI GPT reasoning model
+    // through either the OpenAI API or OpenCode Go. Effort is written in the endpoint's dialect.
+    // {
+    //   "package": "./plugins/orchestrator",
+    //   "options": {
+    //     "provider": "llamacpp",
+    //     "model": "liquid-d1",
+    //     "protocol": "systemone",
+    //     "primaryBackend": "openai"
     //   }
     // },
 
