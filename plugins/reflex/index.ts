@@ -413,6 +413,112 @@ function applyQwenLevel(body: any, level: EffortLevel, url: string): boolean {
   return false;
 }
 
+// Moonshot Kimi levels per complexity level. Kimi's thinking control differs per
+// generation (Moonshot's Model Parameter Reference, verified live through the
+// OpenCode Go openai route):
+// - kimi-k3: thinking always on; intensity via top-level reasoning_effort
+//   ("low"/"high"/"max", default "max"). No thinking parameter (errors if sent).
+//   Verified: reasoning_effort low reduces reasoning tokens vs max.
+// - kimi-k2.7-code / -highspeed: thinking always on, cannot be disabled
+//   (thinking {type:"disabled"} -> 400 "only type=enabled is allowed for this
+//   model"). No documented effort field; it always reasons.
+// - kimi-k2.6: thinking switchable via thinking.type ("enabled"/"disabled");
+//   no effort field.
+// Intensity is therefore only expressible on K3 (reasoning_effort low/max). K3
+// "high" is not sent — its documented top is "max" and "high" maps ambiguously,
+// so medium/high both use "max". Simple disables thinking where the model allows
+// (k2.6), else falls back to the lowest effort (k3 "low"; k2.7 always reasons).
+const KIMI_LEVEL_REQUEST = {
+  simple: { thinking: false, effort: "low", maxEffort: "low" },
+  medium: { thinking: true, effort: "high", maxEffort: "max" },
+  high: { thinking: true, effort: "max", maxEffort: "max" },
+} as const;
+
+// Matches the active Kimi models "kimi-k2.7-code", "kimi-k2.7-code-highspeed",
+// "kimi-k2.6", "kimi-k3", "kimi-k3-swarm-max", and OpenRouter-prefixed
+// "kimi/kimi-k2.7-code" / "moonshotai/kimi-k3". Gate at kimi-k2.7+ or kimi-k3:
+// the retired kimi-k2-thinking / kimi-k2.5 / moonshot-v1-* ids and non-Kimi ids
+// (glm, qwen, mimo) stay untouched. "kind" is "k3" (effort field), "k27"
+// (thinking-only, no effort field) or "k26" (switchable thinking, no effort field).
+function parseKimiModel(model: unknown): { kind: "k3" | "k27" | "k26" } | null {
+  if (typeof model !== "string") return null;
+  const id = model.toLowerCase().split("/").pop() ?? "";
+  if (!id.startsWith("kimi")) return null;
+
+  if (/^kimi-k?3/.test(id)) return { kind: "k3" };
+  if (/^kimi-k2\.7/.test(id)) return { kind: "k27" };
+  if (/^kimi-k2\.6/.test(id)) return { kind: "k26" };
+  return null;
+}
+
+// Applies the session's level to a Moonshot Kimi request body (in place).
+// Returns false when the request must stay untouched (not an active Kimi model,
+// or an endpoint shape Kimi does not serve). The field dialect per generation:
+// - kimi-k3: reasoning_effort (low/high/max) on /chat/completions and /responses
+//   (reasoning.effort); thinking is always on so no toggle is sent.
+// - kimi-k2.7-code: thinking always on; only {"type":"enabled","keep":"all"} is
+//   accepted on /chat/completions (verified against Moonshot's reference), so the
+//   rewrite emits exactly that and never "disabled" (which errors).
+// - kimi-k2.6: thinking.type ("enabled"/"disabled") toggles thought on/off.
+// The /messages (Anthropic) surface maps thinking.type there; K3 effort rides on
+// output_config.effort on that surface (Claude-style).
+function applyKimiLevel(body: any, level: EffortLevel, url: string): boolean {
+  const kimi = parseKimiModel(body?.model);
+  if (!kimi) return false;
+
+  const request = KIMI_LEVEL_REQUEST[level];
+  const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  // Only k2.6 can turn thinking off; k3 and k2.7 always think.
+  const canDisable = kimi.kind === "k26";
+  const on = level !== "simple" || !canDisable;
+
+  if (/\/chat\/completions$/i.test(pathname)) {
+    delete body.reasoning;
+    if (kimi.kind === "k3") {
+      delete body.thinking;
+      body.reasoning_effort = on ? request.maxEffort : "low";
+      return true;
+    }
+    delete body.reasoning_effort;
+    if (kimi.kind === "k27") {
+      // Thinking-only: only {"type":"enabled","keep":"all"} is accepted.
+      body.thinking = { type: "enabled", keep: "all" };
+      return true;
+    }
+    // k2.6: switchable thinking, no effort field.
+    body.thinking = { type: on ? "enabled" : "disabled" };
+    return true;
+  }
+
+  if (/\/responses$/i.test(pathname)) {
+    if (kimi.kind === "k3") {
+      body.reasoning = { effort: on ? request.maxEffort : "low" };
+      return true;
+    }
+    return false;
+  }
+
+  if (isAnthropicMessagesEndpoint(url)) {
+    if (kimi.kind === "k3") {
+      // K3 always thinks and exposes no toggle; effort rides on output_config.
+      delete body.thinking;
+      body.output_config = { ...(body.output_config ?? {}), effort: on ? request.maxEffort : "low" };
+      return true;
+    }
+    const thinking: any = { ...(body.thinking ?? {}) };
+    if (kimi.kind === "k27") {
+      // Thinking-only; keep is not documented on the Anthropic surface, so only type.
+      thinking.type = "enabled";
+    } else {
+      thinking.type = on ? "enabled" : "disabled";
+    }
+    body.thinking = thinking;
+    return true;
+  }
+
+  return false;
+}
+
 // Effort dialect detection is per request, from the model actually being requested.
 // The http.request hook event carries the provider's own model reference
 // (event.model), even when a gateway like OpenCode Go proxies many models
@@ -524,6 +630,9 @@ function detectBackend(model: { providerID?: string; id?: string } | undefined, 
   // (qwen-plus, qwen-max...), through a remote API. A locally served Qwen keeps
   // the local server's own controls.
   if (parseQwenModel(modelId) && !isLocalHost(url)) return "qwen";
+  // Moonshot Kimi models from kimi-k2.7+/kimi-k3 through a remote API. A locally
+  // served Kimi keeps the local server's own controls.
+  if (parseKimiModel(modelId) && !isLocalHost(url)) return "kimi";
   // Local inference servers (llama.cpp, Ollama) on loopback or LAN hosts.
   if (isLocalHost(url)) return "local";
   return null;
@@ -537,7 +646,7 @@ const CONFIDENCE_TOOL = "systemone_check_confidence";
 // Effort dialect a primary request may speak, decided per request from the model
 // being requested. "local": a local inference server (llama.cpp or Ollama) on a
 // loopback or LAN host.
-type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "qwen" | "local";
+type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "qwen" | "kimi" | "local";
 
 interface SystemOneConfig {
   baseURL: string;
@@ -863,6 +972,8 @@ export default Plugin.define({
           if (!applyGeminiLevel(body, level, event.request.url)) return;
         } else if (dialect === "qwen") {
           if (!applyQwenLevel(body, level, event.request.url)) return;
+        } else if (dialect === "kimi") {
+          if (!applyKimiLevel(body, level, event.request.url)) return;
         } else {
           // Local inference server, its kind probed once per origin.
           // Ollama and llama.cpp both take top-level reasoning_effort on
