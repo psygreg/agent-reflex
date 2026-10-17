@@ -1,0 +1,5 @@
+{
+  "name": "agent-reflex",
+  "version": "1.0.0",
+  "description": "Coding agent workflow optimization and safeguarding with any System One decision model. Ports the agent-reflex OpenCode plugin to Qwen Code: a shell guardrail, post-edit syntax and bug checks, complexity classification, compaction guidance, and an on-demand confidence check. Classifier-driven effort and history pruning need the OpenCode plugin because Qwen Code cannot rewrite model requests."
+}

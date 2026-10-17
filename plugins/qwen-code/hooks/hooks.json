@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^run_shell_command$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${extensionPath}/scripts/guard.sh\" guard",
+            "name": "agent-reflex-guard",
+            "timeout": 45
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(write_file|edit|notebook_edit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${extensionPath}/scripts/check.sh\" check",
+            "name": "agent-reflex-check",
+            "timeout": 45
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${extensionPath}/scripts/classify.sh\" classify",
+            "name": "agent-reflex-classify",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "^(auto|manual)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${extensionPath}/scripts/compact.sh\" compact",
+            "name": "agent-reflex-compact",
+            "timeout": 45
+          }
+        ]
+      }
+    ]
+  }
+}
