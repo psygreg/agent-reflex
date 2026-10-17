@@ -6,8 +6,14 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - Improve token efficiency
 - Deliver more reliable solutions to tasks
 
+### Requirement
+The plugin needs a System One decision model as its classifier, served at
+`<baseURL>/systemone` — local llama.cpp (0.6 onwards), Ollama (0.35 onwards) or
+LM Studio (0.4.26 onwards), or TypeSafe Jev and other System One models through
+the TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen. Every
+feature below is driven by this classifier.
+
 ### Features
-- **Classifier**: any System One decision model at `<baseURL>/systemone` — local llama.cpp (0.6 onwards), Ollama (0.35 onwards) and LM Studio (0.4.26 onwards), or TypeSafe Jev and other System One models through the TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen
 - **Decision-driven history compaction**
 - **Dynamic thinking effort level**: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` and switching the reasoning effort accordingly. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin. Wired dialects: Anthropic, llama.cpp, Ollama, OpenAI GPT reasoning models, Z.ai GLM (GLM-5.2 onwards), Xiaomi MiMo (MiMo-V2.5 onwards), Google Gemini (Gemini 3 onwards), Qwen (Qwen3.5 onwards and the qwen-plus/qwen-max aliases), Moonshot Kimi (kimi-k2.7+/kimi-k3), xAI Grok (grok-4.3 onwards) and MiniMax (MiniMax-M3 onwards)
 - **Confidence level tool**: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check the confidence of its current line of thinking before finalizing a response and correct itself along the way if needed

@@ -26,6 +26,15 @@ it first and use `<clone>/install.sh` instead:
 git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
 ```
 
+## Requirement
+
+The plugin needs a System One decision model as its classifier, served at
+`<baseURL>/systemone`: local llama.cpp (0.6+)/Ollama (0.35+)/LM Studio
+(0.4.26+), or TypeSafe's Jev through the TypeSafe API, OpenRouter, the Vercel
+AI Gateway or OpenCode Zen. A `fallbackModel` option retries the classifier when
+the primary model rejects requests (e.g. a free-model window closing). Every
+capability below is driven by this classifier.
+
 ## Capabilities (brief the user with this)
 
 - **Decision-driven history compaction**: when the conversation exceeds 16
@@ -77,12 +86,6 @@ git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
 
 Which features actually reach the agent — and with what caveat — is per agent:
 see the support table below.
-
-The classifier needs a System One endpoint at `<baseURL>/systemone`: local
-llama.cpp/Ollama (0.35+)/LM Studio (0.4.26+), or TypeSafe's Jev through the
-TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen. A
-`fallbackModel` option retries the classifier when the primary model rejects
-requests (e.g. a free-model window closing).
 
 ## Agent support
 
