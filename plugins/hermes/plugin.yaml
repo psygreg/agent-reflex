@@ -1,0 +1,3 @@
+name: agent-reflex
+version: "1.0.0"
+description: Coding agent workflow optimization and safeguarding with any System One decision model. Ports the agent-reflex OpenCode plugin to Hermes: a safe_run command wrapper that blocks dangerous shell commands before they execute, post-edit syntax and bug checks, complexity classification, and an on-demand confidence check. Classifier-driven effort and history pruning need the OpenCode plugin because Hermes cannot rewrite model requests.

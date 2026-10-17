@@ -20,6 +20,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_SRC="$REPO_DIR/plugins/opencode"
 CC_PLUGIN_SRC="$REPO_DIR/plugins/claude-code"
 CX_PLUGIN_SRC="$REPO_DIR/plugins/codex"
+HX_PLUGIN_SRC="$REPO_DIR/plugins/hermes"
 SKILL_SRC="$REPO_DIR/.agents/skills/agent-reflex"
 
 # The global OpenCode config lives in ~/.config/opencode (XDG) or, with some
@@ -236,6 +237,45 @@ install_agent_ports() {
   install_agent_port "$CC_PLUGIN_SRC" "$HOME/.claude/plugins/agent-reflex" "Claude Code" claude plugin install
   # Codex: register via `codex plugin install <dir>`.
   install_agent_port "$CX_PLUGIN_SRC" "$HOME/.codex/plugins/agent-reflex" "Codex" codex plugin install
+  # Hermes: copy the plugin, then enable it in config.yaml (Hermes has no
+  # install command — plugins are discovered by directory but disabled by
+  # default until listed under plugins.enabled).
+  install_agent_port "$HX_PLUGIN_SRC" "$HOME/.hermes/plugins/agent-reflex" "Hermes"
+  enable_hermes_plugin
+}
+
+# Adds "agent-reflex" to plugins.enabled in ~/.hermes/config.yaml (creating the
+# file/section as needed). Hermes refuses to load a plugin that is not enabled.
+enable_hermes_plugin() {
+  local cfg="$HOME/.hermes/config.yaml"
+  mkdir -p "$HOME/.hermes"
+  if [ ! -f "$cfg" ]; then
+    printf 'plugins:\n  enabled:\n    - agent-reflex\n' > "$cfg"
+    msg "Hermes plugin enabled in ${DIM}${cfg}${RESET}"
+    return 0
+  fi
+  if grep -qE '(^|[[:space:]])-[[:space:]]*agent-reflex[[:space:]]*$' "$cfg" 2>/dev/null; then
+    msg "Hermes plugin already enabled — left untouched."
+    return 0
+  fi
+  # Insert under an existing plugins.enabled list, or append a new block.
+  if grep -qE '^[[:space:]]*enabled:[[:space:]]*$' "$cfg" 2>/dev/null; then
+    # Append "- agent-reflex" to the first enabled: list block.
+    awk '
+      /^[[:space:]]*enabled:[[:space:]]*$/ && !done { print; print "    - agent-reflex"; done=1; next }
+      { print }
+    ' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+    msg "Hermes plugin enabled in ${DIM}${cfg}${RESET}"
+  elif grep -qE '^[[:space:]]*plugins:[[:space:]]*$' "$cfg" 2>/dev/null; then
+    awk '
+      /^[[:space:]]*plugins:[[:space:]]*$/ && !done { print; print "  enabled:"; print "    - agent-reflex"; done=1; next }
+      { print }
+    ' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+    msg "Hermes plugin enabled in ${DIM}${cfg}${RESET}"
+  else
+    printf '\nplugins:\n  enabled:\n    - agent-reflex\n' >> "$cfg"
+    msg "Hermes plugin enabled in ${DIM}${cfg}${RESET}"
+  fi
 }
 
 # ---------------------------------------------------------------
