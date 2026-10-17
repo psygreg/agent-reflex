@@ -33,6 +33,11 @@
     //                  closes ("jev-1.13-free" falling back to "jev-1.13").
     //   apiKey         Optional Bearer token. Use "{env:NAME}" instead of a literal key.
     //   debugLog       Optional file path. Appends each primary request body after rewrites.
+    //   tools          Tool exposure: "auto" (default) narrows the tool set to what
+    //                  each prompt needs (saving input tokens); "all" keeps every
+    //                  tool exposed. A core set and any tool already used this
+    //                  session are always kept, and everything is kept if the
+    //                  classifier is unavailable.
 
     // Classifier on a local llama.cpp server with the System One API (/systemone).
     // Effort control is automatic: every model that supports it gets effort written

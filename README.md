@@ -12,6 +12,7 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - Decision-driven history compaction
 - Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp, Ollama, OpenAI GPT reasoning models, Z.ai GLM models (GLM-5.2 onwards), Xiaomi MiMo models (MiMo-V2.5 onwards), Google Gemini models (Gemini 3 onwards), Qwen models (Qwen3.5 onwards and the qwen-plus/qwen-max aliases) Moonshot Kimi models (kimi-k2.7+/kimi-k3), xAI Grok models (grok-4.3 onwards) and MiniMax models (MiniMax-M3 onwards) in accordance. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin
 - Confidence level tool: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check for the confidence level of its current line of thinking before finalizing a response and correct itself in the way if needed
+- Tool exposure: for each prompt the classifier decides which tools the task actually needs and the model is given only those, so the request carries fewer tool schemas and saves input tokens. Always keeps a core set (read, grep, glob, edit, write, bash, shell, task…) and any tool already used this session, and falls back to exposing everything if the classifier is unavailable. Only reaches agents whose hook API can drop tools from the model's request (OpenCode and Pi); the shell-hook agents can only block a tool call after the model already picked it, which saves no tokens, so they do not get this feature
 - Up to two-step syntax checks after `edit` and `write` tool calls using parsers and decision model
 - Shell command check guardrail against commands that may cause damage to a repository or remove files without backup
 
@@ -22,20 +23,23 @@ Eight agents are supported. The classifier config is shared across all of them
 once. The two features that require the plugin to rewrite the model request — dynamic
 effort and custom history pruning — only reach agents whose hook API can do that.
 
-| Agent | Shell guardrail | Post-edit checks | Classify + confidence | Compaction guidance | Dynamic effort | History pruning | Notes |
-|---|---|---|---|---|---|---|---|
-| **OpenCode** | ✅ hard block | ✅ inline | ✅ | ✅ built-in | ✅ full (per-model dialects) | ✅ pruning | Reference implementation and the only agent where everything works. |
-| **Pi** | ✅ hard block | ✅ inline | ✅ | ✅ via `context` | ✅ full (`setThinkingLevel`) | ✅ opt-in pruning | Pi translates the unified effort level per model itself, so no per-vendor dialect code is needed. |
-| **MiMo Code** | ✅ hard block | ✅ inline | ✅ | ✅ compacting hook | ⚠️ token cap only | ✅ opt-in pruning | OpenCode-derived. `chat.params` sets `maxTokens` but not `reasoning_effort`, so effort cannot change how hard the model thinks. |
-| **Claude Code** | ✅ hard block | ✅ inline | ✅ | ✅ `custom_instructions` | ❌ | ❌ | Hooks cannot rewrite the model request or return a pruned message list. |
-| **Qwen Code** | ✅ hard block | ✅ inline | ✅ | ✅ `custom_instructions` | ❌ | ❌ | Same hook limits as Claude Code. Strongest of the shell-hook ports. |
-| **Codex** | ✅ hard block | ✅ inline | ✅ | ❌ inert | ❌ | ❌ | No `PreCompact` `custom_instructions`; its compaction hook can only cancel compaction. Edits arrive via `apply_patch` (V4A). |
-| **Antigravity** | ✅ hard block | ⚠️ one turn late | ✅ | ❌ inert | ❌ | ❌ | `PostToolUse` cannot inject context (open upstream antigravity-cli#808), so findings queue and surface at the next model call. |
-| **Hermes** | ⚠️ wrapper tool | ✅ inline | ✅ | ❌ none | ❌ | ❌ | Hooks cannot block a tool call, so the guardrail is a `safe_run` wrapper over `terminal`. No compaction hook. |
+| Agent | Shell guardrail | Post-edit checks | Classify + confidence | Compaction guidance | Dynamic effort | History pruning | Tool exposure | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **OpenCode** | ✅ hard block | ✅ inline | ✅ | ✅ built-in | ✅ full (per-model dialects) | ✅ pruning | ✅ | Reference implementation and the only agent where everything works. |
+| **Pi** | ✅ hard block | ✅ inline | ✅ | ✅ via `context` | ✅ full (`setThinkingLevel`) | ✅ opt-in pruning | ✅ (`setActiveTools`) | Pi translates the unified effort level per model itself, so no per-vendor dialect code is needed. |
+| **MiMo Code** | ✅ hard block | ✅ inline | ✅ | ✅ compacting hook | ⚠️ token cap only | ✅ opt-in pruning | ❌ | OpenCode-derived. `chat.params` sets `maxTokens` but not `reasoning_effort`, so effort cannot change how hard the model thinks. |
+| **Claude Code** | ✅ hard block | ✅ inline | ✅ | ✅ `custom_instructions` | ❌ | ❌ | ❌ | Hooks cannot rewrite the model request or return a pruned message list. |
+| **Qwen Code** | ✅ hard block | ✅ inline | ✅ | ✅ `custom_instructions` | ❌ | ❌ | ❌ | Same hook limits as Claude Code. Strongest of the shell-hook ports. |
+| **Codex** | ✅ hard block | ✅ inline | ✅ | ❌ inert | ❌ | ❌ | ❌ | No `PreCompact` `custom_instructions`; its compaction hook can only cancel compaction. Edits arrive via `apply_patch` (V4A). |
+| **Antigravity** | ✅ hard block | ⚠️ one turn late | ✅ | ❌ inert | ❌ | ❌ | ❌ | `PostToolUse` cannot inject context (open upstream antigravity-cli#808), so findings queue and surface at the next model call. |
+| **Hermes** | ⚠️ wrapper tool | ✅ inline | ✅ | ❌ none | ❌ | ❌ | ❌ | Hooks cannot block a tool call, so the guardrail is a `safe_run` wrapper over `terminal`. No compaction hook. |
 
 Legend: ✅ works · ⚠️ works with a documented compromise · ❌ not possible (agent hook
 API limitation). Dynamic effort means both the reasoning/thinking level and the
-per-level `maxTokens` cap where the agent exposes one.
+per-level `maxTokens` cap where the agent exposes one. Tool exposure means the
+agent can remove tool schemas from the model's request (real input-token savings);
+the shell-hook agents can only deny a tool call after the model already chose it,
+which saves nothing and is therefore marked ❌.
 
 ## Usage
 Install the skill using `npx skills add psygreg/agent-reflex` or `bun x skills add psygreg/agent-reflex` then ask your agent to do it: the skill briefs the agent on the plugin's capabilities and installs or updates it — updates need no answers (`bash install.sh </dev/null`), fresh installs collect the answers in chat and pipe them in.

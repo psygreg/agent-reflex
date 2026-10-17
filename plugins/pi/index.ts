@@ -17,7 +17,7 @@
 //   - tool_result: post-edit syntax + bug check, findings appended to the result.
 //   - confidence_check tool + /confidence command: on-demand confidence scoring.
 
-import { arAsk, classifyLevel, config, arLog } from "./classifier";
+import { arAsk, arAskMany, classifyLevel, config, arLog } from "./classifier";
 import { findSyntaxErrors, excerptAroundEdit, readFileText, CONTEXT_LINES } from "./check";
 
 // Complexity -> Pi thinking level. simple disables thinking where the model
@@ -41,6 +41,7 @@ const EDIT_TOOLS = new Set(["edit", "write", "write_file", "edit_file", "apply_p
 const state = {
   level: "simple" as "simple" | "medium" | "high",
   failures: new Map<string, number>(),
+  usedTools: new Set<string>(),
 };
 
 // History pruning (OpenCode's HOOK 1a) is opt-in: it makes one classifier call per
@@ -59,6 +60,103 @@ const PRUNE_KEEP_THRESHOLD = 0.4;
 // match the plugin's LEVEL_REQUEST.maxTokens (simple 8192, medium 65536, high 131072).
 const MAXTOKENS_ENABLED = process.env.AGENT_REFLEX_MAXTOKENS === "1";
 const LEVEL_MAX_TOKENS: Record<string, number> = { simple: 8192, medium: 65536, high: 131072 };
+
+// Tool exposure (OpenCode HOOK 1c): give the model only the tools this task needs,
+// so the request carries fewer tool schemas. Pi exposes the clean primitive for
+// this — pi.getAllTools() / pi.getActiveTools() / pi.setActiveTools(names) — so
+// unlike the shell ports (Claude Code, Codex, Qwen, Antigravity) real token
+// savings are possible here. ON by default; disable with AGENT_REFLEX_TOOLS=0 (or
+// "all"). The decision is driven by System One and always fails open (keeps every
+// tool) on any classifier error, and never drops an always-keep core tool or one
+// the model has already used this session.
+const TOOL_EXPOSURE_ENABLED = (process.env.AGENT_REFLEX_TOOLS ?? "auto") === "auto";
+const TOOL_RELEVANCE_THRESHOLD = 0.35;
+
+// Always-keep core: never removed regardless of the classifier, so the model can
+// always find/read/search and reach the essential actions.
+const TOOL_CORE = new Set(["read", "grep", "glob", "edit", "write", "bash", "shell", "task", "ls", "find"]);
+
+// Fallback tiers when the per-tool batch is unsupported (backend answers one
+// question). Each tier is a matcher over the tool name; everything outside it is
+// removed. Ordered narrow (read-only) -> wide (everything).
+const TOOL_TIERS: Array<(name: string) => boolean> = [
+  (n) => /^(read|grep|glob|ls|list|find)$/.test(n) || /_?(read|search|find|list|grep|glob)$/.test(n),
+  (n) => /^(read|grep|glob|ls|list|find|edit|write|patch|multiedit)$/.test(n) || /_?(edit|write|patch)$/.test(n),
+  () => true,
+];
+
+function tierForScore(score: number): number {
+  if (score <= 0.33) return 0;
+  if (score <= 0.66) return 1;
+  return 2;
+}
+
+// Applies System One tool exposure: narrows the active tool set to what this task
+// needs. Two decision paths (mirrors the OpenCode plugin):
+//  1. Per-tool batch — one arAskMany call scores every candidate tool; those below
+//     TOOL_RELEVANCE_THRESHOLD are dropped. A candidate the backend did not answer
+//     is kept (fail-open per tool).
+//  2. Tier fallback — if the batch returned no answers (single-question backend),
+//     one scalar arAsk call picks a tier (READ/EDIT/FULL) and everything outside it
+//     is dropped.
+// Keeps the always-keep core and anything already used this session. Fails open
+// (keeps every active tool) on any error or null score.
+async function applyToolExposure(pi: any, prompt: string): Promise<void> {
+  if (!TOOL_EXPOSURE_ENABLED) return;
+
+  let all: string[];
+  try {
+    all = (pi.getAllTools?.() ?? []).map((t: any) => (typeof t === "string" ? t : t?.name ?? t?.toolName ?? "")).filter(Boolean);
+  } catch {
+    return;
+  }
+  if (all.length === 0) return;
+
+  const active: string[] = (pi.getActiveTools?.() ?? all).map((t: any) => (typeof t === "string" ? t : t?.name ?? t?.toolName ?? "")).filter(Boolean);
+  const pool = active.length > 0 ? active : all;
+
+  const candidates = pool.filter((name) => !TOOL_CORE.has(name) && !state.usedTools.has(name));
+  if (candidates.length === 0) return;
+
+  const stateText = `User request: ${prompt.trim()}`;
+  const keep = new Set<string>();
+
+  try {
+    const questionsById: Record<string, string> = {};
+    for (const name of candidates) {
+      questionsById[name] = `Would the "${name}" tool be needed to fully answer this user request? Answer YES only if this specific tool is likely required.`;
+    }
+    const scores = await arAskMany(stateText, questionsById);
+
+    const answered = candidates.filter((name) => typeof scores[name] === "number");
+    if (answered.length > 0) {
+      for (const name of pool) {
+        const score = scores[name];
+        // Keep core/used tools, tools with no answer, and tools scoring at/above threshold.
+        if (TOOL_CORE.has(name) || state.usedTools.has(name) || typeof score !== "number" || score >= TOOL_RELEVANCE_THRESHOLD) {
+          keep.add(name);
+        }
+      }
+    } else {
+      // Batch unsupported -> one scalar picks a tier.
+      const needScore = await arAsk(
+        stateText,
+        "Does solving this request require running shell commands, editing or writing files, or anything beyond reading and searching? YES means it needs more than read-only tools.",
+      );
+      if (needScore === null) return; // fail-open: keep all active tools
+      const tier = TOOL_TIERS[tierForScore(needScore)];
+      for (const name of pool) {
+        if (TOOL_CORE.has(name) || state.usedTools.has(name) || tier(name)) keep.add(name);
+      }
+    }
+
+    if (keep.size === 0 || keep.size >= pool.length) return; // nothing to trim
+    pi.setActiveTools([...keep]);
+    arLog(`tools: exposed ${keep.size}/${pool.length} (${[...keep].sort().join(",")})`);
+  } catch (error: any) {
+    arLog(`tools: exposure failed (${error?.message ?? error}); keeping all`);
+  }
+}
 
 function isStructuralMessage(msg: any): boolean {
   if (msg?.role === "tool" || msg?.role === "toolResult") return true;
@@ -97,10 +195,15 @@ function extractEdited(input: any): string | undefined {
 }
 
 export default function (pi: any) {
-  // ---- before_agent_start: complexity classification + dynamic effort ----
+  // ---- before_agent_start: tool exposure + complexity classification + effort ----
   pi.on("before_agent_start", async (event: any, _ctx: any) => {
     const prompt = typeof event?.prompt === "string" ? event.prompt : "";
     if (!prompt.trim()) return undefined;
+
+    // Tool exposure runs first and independently of the complexity score, so the
+    // model still gets a trimmed tool set when the classifier is unavailable or the
+    // complexity question returns null. It fails open internally.
+    await applyToolExposure(pi, prompt);
 
     const score = await arAsk(
       `User prompt: ${prompt.trim()}`,
@@ -209,6 +312,9 @@ export default function (pi: any) {
   // ---- tool_call: shell guardrail (hard block) ----
   pi.on("tool_call", async (event: any, _ctx: any) => {
     const name = String(event?.toolName ?? "").toLowerCase();
+    // Remember every tool the model reaches for so tool exposure keeps it on later
+    // turns of the same task (a multi-step task never loses a tool mid-flight).
+    if (name) state.usedTools.add(name);
     if (!SHELL_TOOLS.has(name)) return undefined;
 
     const command =

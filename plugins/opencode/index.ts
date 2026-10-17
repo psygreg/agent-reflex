@@ -850,6 +850,10 @@ interface SystemOneConfig {
   fallbackModel?: string;
   apiKey?: string;
   debugLog?: string;
+  // Tool exposure: "auto" (default) lets System One decide which tools the task
+  // needs and drops the rest from the request; "all" disables filtering and keeps
+  // every tool. Anything else is treated as "all" (fail-open).
+  toolExposure: "auto" | "all";
 }
 
 function resolveConfig(options: Record<string, unknown>): SystemOneConfig | null {
@@ -858,12 +862,14 @@ function resolveConfig(options: Record<string, unknown>): SystemOneConfig | null
   const model = options.model as string | undefined;
   if (!baseURL || !model) return null;
 
+  const toolsOpt = (options.tools as string | undefined) ?? (options.toolExposure as string | undefined);
   return {
     baseURL: baseURL.replace(/\/+$/, ""),
     model,
     fallbackModel: typeof options.fallbackModel === "string" ? options.fallbackModel : undefined,
     apiKey: options.apiKey as string | undefined,
     debugLog: typeof options.debugLog === "string" ? options.debugLog : undefined,
+    toolExposure: toolsOpt === "auto" ? "auto" : "all",
   };
 }
 
@@ -926,6 +932,170 @@ async function askSystemOne(config: SystemOneConfig, state: string, question: st
     }
   }
   return null;
+}
+
+// Batched System One query: one request carrying a question per tool id, so a
+// whole tool set is scored in a single round-trip. The request shape is the same
+// System One wire format as askSystemOne (model, state, questions) but with a key
+// per tool; the response is read per key (answers.<id>.noul). Returns a map of
+// id -> P(YES) in [0, 1]. Ids the backend did not answer are omitted, which
+// lets a caller detect a backend that only honors a single question and fall
+// back rather than treat silence as "not relevant".
+async function askSystemOneMany(config: SystemOneConfig, state: string, questionsById: Record<string, string>): Promise<Record<string, number>> {
+  const ids = Object.keys(questionsById);
+  if (ids.length === 0) return {};
+
+  const ask = async (model: string): Promise<Record<string, number> | null> => {
+    const questions: Record<string, { type: string; instructions: string }> = {};
+    for (const id of ids) questions[id] = { type: "noul", instructions: questionsById[id] };
+
+    const response = await fetch(`${config.baseURL}/systemone`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(config.apiKey ? { "Authorization": `Bearer ${config.apiKey}` } : {}),
+      },
+      body: JSON.stringify({ model, state, questions }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as any;
+    const out: Record<string, number> = {};
+    for (const id of ids) {
+      const value = Number(data.answers?.[id]?.noul);
+      if (Number.isFinite(value)) out[id] = Math.min(Math.max(value, 0), 1);
+    }
+    return out;
+  };
+
+  try {
+    const primary = await ask(config.model);
+    if (primary && Object.keys(primary).length > 0) return primary;
+  } catch {
+    // fall through to the fallback model
+  }
+
+  if (config.fallbackModel && config.fallbackModel !== config.model) {
+    try {
+      return (await ask(config.fallbackModel)) ?? {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+// ============ TOOL EXPOSURE (give the model only the tools a task needs) ============
+// Tool schemas (description + JSON schema) are part of the model's input, so
+// dropping tools the task cannot use saves input tokens. The decision is driven
+// by System One and lives in the context hook, which owns the mutable event.tools
+// map (a Record<name, {description, input}>); deleting a key removes the tool
+// from the outgoing request.
+//
+// Always-keep core: these are never removed regardless of the classifier, so the
+// model can always find/read/search. Anything the model has already invoked this
+// session is also kept, so a multi-step task never loses a tool mid-flight.
+const TOOL_CORE = new Set(["read", "grep", "glob", "edit", "write", "bash", "shell", "task"]);
+
+// Fallback tiers used when the per-tool batch is not supported by the classifier
+// backend (it only answers one question). Each tier is the set of tool-name
+// prefixes that stay exposed; everything else is dropped. Ordered narrow -> wide.
+const TOOL_TIERS: Array<{ match: (name: string) => boolean }> = [
+  // READ: inspect/search only.
+  { match: (n) => /^(read|grep|glob|ls|list|find)$/.test(n) || /_?(read|search|find|list|grep|glob)$/.test(n) },
+  // EDIT: read + modify files (adds write/edit/patch-style tools, no shell).
+  { match: (n) => /^(read|grep|glob|ls|list|find|edit|write|patch|multiedit)$/.test(n) || /_?(edit|write|patch)$/.test(n) },
+  // FULL: everything (shell, web, task, subagents, etc.).
+  { match: () => true },
+];
+
+// Picking a tier from one scalar relevance score: low -> READ, mid -> EDIT, high -> FULL.
+function tierForScore(score: number): number {
+  if (score <= 0.33) return 0;
+  if (score <= 0.66) return 1;
+  return 2;
+}
+
+// Names of tools the model has already invoked in this session's transcript.
+// These are kept no matter what, so a task that has already reached for a tool
+// never loses it on a later turn of the same task.
+function usedToolNames(messages: any[]): Set<string> {
+  const used = new Set<string>();
+  for (const msg of messages ?? []) {
+    const calls = msg?.tool_calls ?? (Array.isArray(msg?.content) ? msg.content.filter((p: any) => p?.type === "tool_use" || p?.type === "tool-call") : []);
+    for (const call of calls) {
+      const name = call?.function?.name ?? call?.name;
+      if (typeof name === "string" && name) used.add(name);
+    }
+  }
+  return used;
+}
+
+// Applies System One tool exposure to the request's tool map (in place). Keeps the
+// always-keep core and anything already used, scores the rest, and deletes the
+// tools the task does not need. Two decision paths:
+//  1. Per-tool batch: one askSystemOneMany call scores every candidate tool at
+//     once; tools below TOOL_RELEVANCE_THRESHOLD are dropped. Used when the
+//     backend answers more than one question.
+//  2. Tier fallback: if the batch came back empty (backend single-question only),
+//     one scalar call picks a fixed tier (READ/EDIT/FULL) and everything outside
+//     it is dropped.
+// Any error or null score leaves event.tools untouched (fail-open).
+const TOOL_RELEVANCE_THRESHOLD = 0.35;
+
+async function applyToolExposure(config: SystemOneConfig, event: { tools: Record<string, unknown>; messages: any[] }): Promise<void> {
+  if (config.toolExposure !== "auto") return;
+  const tools = event.tools;
+  if (!tools) return;
+
+  const allNames = Object.keys(tools);
+  if (allNames.length <= TOOL_CORE.size) return; // nothing meaningful to trim
+
+  const used = usedToolNames(event.messages);
+  const candidates = allNames.filter((name) => !TOOL_CORE.has(name) && !used.has(name));
+  if (candidates.length === 0) return;
+
+  const lastMessage = event.messages[event.messages.length - 1];
+  const userPrompt = contentToText(lastMessage?.content);
+  const state = `User request: ${userPrompt.trim()}`;
+
+  try {
+    // Path 1: score every candidate tool in one call.
+    const questionsById: Record<string, string> = {};
+    for (const name of candidates) {
+      questionsById[name] = `Would the "${name}" tool be needed to fully answer this user request? Answer YES only if this specific tool is likely required.`;
+    }
+    const scores = await askSystemOneMany(config, state, questionsById);
+
+    const answered = candidates.filter((name) => typeof scores[name] === "number");
+    if (answered.length > 0) {
+      for (const name of candidates) {
+        const score = scores[name];
+        // Drop only tools the backend explicitly deemed irrelevant. A candidate
+        // the backend did not answer is kept (fail-open per tool).
+        if (typeof score === "number" && score < TOOL_RELEVANCE_THRESHOLD) delete tools[name];
+      }
+      console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${allNames.length} tools (per-tool scoring).`);
+      return;
+    }
+
+    // Path 2: batch unsupported -> one scalar picks a tier.
+    const needScore = await askSystemOne(
+      config,
+      state,
+      "Does solving this request require running shell commands, editing or writing files, or anything beyond reading and searching? YES means it needs more than read-only tools."
+    );
+    if (needScore === null) return; // fail-open: keep all tools
+
+    const tier = TOOL_TIERS[tierForScore(needScore)];
+    for (const name of candidates) {
+      if (!tier.match(name)) delete tools[name];
+    }
+    console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${allNames.length} tools (tier ${tierForScore(needScore)}).`);
+  } catch (error: any) {
+    console.warn(`[System One Tools]: Tool exposure failed (${error.message}); keeping all tools.`);
+  }
 }
 
 const EDIT_TOOLS = new Set(["edit", "write"]);
@@ -1127,6 +1297,14 @@ export default Plugin.define({
       } catch (error: any) {
         console.warn(`[Modulator Warning]: Failed to modulate parameters: ${error.message}`);
       }
+
+      // ---- SUB-ROUTINE C: TOOL EXPOSURE (only the tools this task needs) ----
+      // Drops tools whose schemas cannot help this request, so the model's input
+      // carries fewer tool definitions. Fails open (keeps every tool) on any
+      // classifier error and never drops the always-keep core or a tool the model
+      // has already used this session. Runs last so it always has the final word
+      // on event.tools for this request.
+      await applyToolExposure(config, event);
     });
 
     // ==========================================

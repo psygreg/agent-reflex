@@ -32,6 +32,12 @@ your classifier settings.
   Findings are appended to the tool result so the agent can fix problems.
 - **Complexity classification** (`before_agent_start`): also injects a note
   suggesting a confidence check on medium/high.
+- **Tool exposure** (`before_agent_start`): decides which tools the task needs
+  and narrows the active set with `pi.setActiveTools()`, so the request carries
+  fewer tool schemas and saves input tokens. A core set (read, grep, glob, edit,
+  write, bash, shell, task…) and any tool already used this session are always
+  kept, and everything stays exposed if the classifier is unavailable. Disable
+  with `AGENT_REFLEX_TOOLS=0`.
 - **Confidence check** (`confidence_check` tool and `/confidence` command): scores
   the model's current line of thought and returns CONTINUE or RESTART.
 
@@ -63,6 +69,7 @@ Two features carry real cost or override provider defaults, so they are opt-in:
 |---|---|
 | `AGENT_REFLEX_PRUNE=1` | Enable history pruning (`context`). Makes one classifier call per old message before every model request — real latency and token cost. Off by default. |
 | `AGENT_REFLEX_MAXTOKENS=1` | Set the request token cap per level (`before_provider_request`), matching the plugin's `maxTokens` (simple 8192, medium 65536, high 131072). Overrides the provider's own cap. Off by default. |
+| `AGENT_REFLEX_TOOLS=0` | Disable tool exposure. When set to `0` (or `all`), every tool stays exposed. On by default (`auto`); makes one classifier batch call per prompt to score the tools. |
 
 The effort tuning, guardrail, post-edit check, and confidence check are always on.
 

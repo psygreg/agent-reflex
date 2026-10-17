@@ -42,7 +42,7 @@ interface Config {
   debugLog?: string;
 }
 
-let configCache: Config | null | undefined;
+let configCache: Config | undefined;
 
 // Strips // line comments (only when // begins a token) and trailing commas so
 // JSON.parse can read JSONC.
@@ -59,14 +59,14 @@ function loadConfig(): Config {
     if (!existsSync(path)) continue;
     try {
       const parsed = JSON.parse(stripJsonc(readFileSync(path, "utf8")));
-      configCache = typeof parsed === "object" && parsed !== null ? parsed : {};
+      configCache = typeof parsed === "object" && parsed !== null ? (parsed as Config) : {};
       return configCache;
     } catch {
       // keep looking / fall through to empty
     }
   }
   configCache = {};
-  return configCache;
+  return configCache as Config;
 }
 
 export function config(key: keyof Config): string | undefined {
@@ -157,4 +157,63 @@ export function classifyLevel(score: number): "simple" | "medium" | "high" {
   if (score > 0.8) return "high";
   if (score > 0.5) return "medium";
   return "simple";
+}
+
+// Batched System One query: one request carrying a question per id, so a whole
+// tool set is scored in a single round-trip. Same wire shape as askModel but with
+// a key per id; the response is read per key (answers.<id>.noul). Returns a map of
+// id -> P(YES) in [0, 1]. Ids the backend did not answer are omitted, letting a
+// caller detect a single-question-only backend and fall back rather than treat
+// silence as "not relevant".
+async function askModelMany(state: string, questionsById: Record<string, string>, model: string): Promise<Record<string, number>> {
+  const ids = Object.keys(questionsById);
+  const out: Record<string, number> = {};
+  if (ids.length === 0) return out;
+
+  const base = baseUrl();
+  if (!base || !model) return out;
+  const key = resolveEnv(config("apiKey")) || undefined;
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (key) headers["Authorization"] = `Bearer ${key}`;
+
+  const questions: Record<string, { type: string; instructions: string }> = {};
+  for (const id of ids) questions[id] = { type: "noul", instructions: questionsById[id] };
+
+  let data: any;
+  try {
+    const resp = await fetch(`${base}/systemone`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model, state, questions }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!resp.ok) return out;
+    data = await resp.json();
+  } catch {
+    return out;
+  }
+
+  for (const id of ids) {
+    const value = Number(data?.answers?.[id]?.noul);
+    if (Number.isFinite(value)) out[id] = Math.min(1, Math.max(0, value));
+  }
+  return out;
+}
+
+// Asks the classifier many questions in one call, falling back to fallbackModel
+// when the primary returns nothing. Returns a map of id -> P(YES); ids with no
+// usable answer are absent. Fails open to {} when the classifier is unavailable.
+export async function arAskMany(state: string, questionsById: Record<string, string>): Promise<Record<string, number>> {
+  const model = config("model");
+  if (!model) return {};
+
+  const primary = await askModelMany(state, questionsById, model);
+  if (Object.keys(primary).length > 0) return primary;
+
+  const fallback = config("fallbackModel");
+  if (fallback && fallback !== model) {
+    return askModelMany(state, questionsById, fallback);
+  }
+  return primary;
 }
