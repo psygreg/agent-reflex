@@ -519,6 +519,92 @@ function applyKimiLevel(body: any, level: EffortLevel, url: string): boolean {
   return false;
 }
 
+// xAI Grok request fields per complexity level. Grok's knob is reasoning_effort
+// on /chat/completions and reasoning.effort on /responses; there is no separate
+// thinking toggle. What differs per generation is the vocabulary and whether
+// reasoning can be turned off (xAI's Reasoning docs and the grok-4.3 model card):
+// - grok-4.3: reasoning is configurable and CAN be disabled ("none"), with
+//   low/medium/high/xhigh effort tiers (default "low").
+// - grok-4.5 / 4.6 / 4.7: reasoning CANNOT be disabled; tiers are low/medium/high
+//   (default "high"), plus "xhigh" from grok-4.6 onwards.
+// - grok-4 and older (grok-3-mini, retired grok-4-fast): effort is either
+//   rejected (grok-4 errors on reasoning_effort) or is a separate model id, so
+//   they are left untouched rather than risk a foreign or 400ing field.
+// Simple disables reasoning only where the model allows it (grok-4.3 "none"),
+// falling back to the lowest effort otherwise. "high" maps to "xhigh" where the
+// model's top tier is xhigh (grok-4.3/4.6+), mirroring the Qwen convention.
+const GROK_LEVEL_REQUEST = {
+  simple: { thinking: false, effort: "low" },
+  medium: { thinking: true, effort: "medium" },
+  high: { thinking: true, effort: "high" },
+} as const;
+
+// Grok capabilities parsed from the model id found in a request body.
+// canDisable: reasoning can be switched off ("none") — grok-4.3 only. Models
+// that cannot disable it fall back to the lowest effort on the simple level.
+// xhigh: the top effort tier is "xhigh" rather than "high" (grok-4.3, 4.6+).
+interface GrokModel {
+  canDisable: boolean;
+  xhigh: boolean;
+}
+
+// Matches "grok-4.3", "grok-4.5", "Grok-4.6", "grok-4.7", "x-ai/grok-4.3",
+// "grok4.3"... Only grok-4.3 onwards is accepted: the 4.0 generation rejects
+// reasoning_effort, and grok-3-mini / grok-4-fast use their own (retired) ids.
+// Multi-agent variants route their reasoning knob at agent count, not effort,
+// so they are excluded, as are media models (imagine, voice, vision, tts).
+function parseGrokModel(model: unknown): GrokModel | null {
+  if (typeof model !== "string") return null;
+  const id = model.toLowerCase().split("/").pop() ?? "";
+  if (/(?:imagine|voice|vision|tts|image|agent)/.test(id)) return null;
+  const match = id.match(/^grok[-_.\s]?v?(\d+)(?:[._-](\d+))?/);
+  if (!match) return null;
+  const major = parseInt(match[1], 10);
+  const minor = match[2] ? parseInt(match[2], 10) : 0;
+  // grok-4.3 is the first generation with a configurable reasoning knob.
+  if (major < 4 || (major === 4 && minor < 3)) return null;
+  const atLeast = (needMajor: number, needMinor: number) => major > needMajor || (major === needMajor && minor >= needMinor);
+  return {
+    // "none" is a grok-4.3-only tier; 4.5+ cannot disable reasoning.
+    canDisable: !atLeast(4, 5),
+    // grok-4.3 and grok-4.6+ top out at xhigh; grok-4.5 is high-only.
+    xhigh: !atLeast(4, 5) || atLeast(4, 6),
+  };
+}
+
+// Applies the session's level to a Grok request body (in place). Returns false
+// when the request must stay untouched (not a grok-4.3+ model, or an endpoint
+// shape Grok does not serve). The field dialect per surface:
+// - /responses (xAI's OpenAI Responses surface): reasoning.effort.
+// - /chat/completions (xAI's OpenAI-compatible surface, OpenRouter, any gateway):
+//   reasoning_effort, unless OpenRouter's unified reasoning.effort is expected.
+// Simple sets "none" where the model supports it (grok-4.3), else the lowest
+// effort (Grok 4.5+ reasons regardless). presencePenalty, frequencyPenalty and
+// stop are rejected by Grok reasoning models, but those are the caller's fields
+// and are left alone here.
+function applyGrokLevel(body: any, level: EffortLevel, url: string): boolean {
+  const grok = parseGrokModel(body?.model);
+  if (!grok) return false;
+
+  const request = GROK_LEVEL_REQUEST[level];
+  const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  const effort = level === "high" && grok.xhigh ? "xhigh" : request.effort;
+  const value = level === "simple" && !grok.canDisable ? effort : level === "simple" ? "none" : effort;
+
+  if (/\/responses$/i.test(pathname)) {
+    body.reasoning = { ...(body.reasoning && typeof body.reasoning === "object" ? body.reasoning : {}), effort: value };
+    return true;
+  }
+
+  if (/\/chat\/completions$/i.test(pathname)) {
+    if (isOpenRouterUrl(url)) body.reasoning = { effort: value };
+    else body.reasoning_effort = value;
+    return true;
+  }
+
+  return false;
+}
+
 // Effort dialect detection is per request, from the model actually being requested.
 // The http.request hook event carries the provider's own model reference
 // (event.model), even when a gateway like OpenCode Go proxies many models
@@ -633,6 +719,7 @@ function detectBackend(model: { providerID?: string; id?: string } | undefined, 
   // Moonshot Kimi models from kimi-k2.7+/kimi-k3 through a remote API. A locally
   // served Kimi keeps the local server's own controls.
   if (parseKimiModel(modelId) && !isLocalHost(url)) return "kimi";
+  if (parseGrokModel(modelId) && !isLocalHost(url)) return "grok";
   // Local inference servers (llama.cpp, Ollama) on loopback or LAN hosts.
   if (isLocalHost(url)) return "local";
   return null;
@@ -646,7 +733,7 @@ const CONFIDENCE_TOOL = "systemone_check_confidence";
 // Effort dialect a primary request may speak, decided per request from the model
 // being requested. "local": a local inference server (llama.cpp or Ollama) on a
 // loopback or LAN host.
-type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "qwen" | "kimi" | "local";
+type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "qwen" | "kimi" | "grok" | "local";
 
 interface SystemOneConfig {
   baseURL: string;
@@ -974,6 +1061,8 @@ export default Plugin.define({
           if (!applyQwenLevel(body, level, event.request.url)) return;
         } else if (dialect === "kimi") {
           if (!applyKimiLevel(body, level, event.request.url)) return;
+        } else if (dialect === "grok") {
+          if (!applyGrokLevel(body, level, event.request.url)) return;
         } else {
           // Local inference server, its kind probed once per origin.
           // Ollama and llama.cpp both take top-level reasoning_effort on
