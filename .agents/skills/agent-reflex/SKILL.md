@@ -8,7 +8,8 @@ description: Brief on the agent-reflex plugin's capabilities, and install or upd
 An OpenCode plugin that adds a small System One decision model (Jev, nimble, d1,
 liquid-d1...) as a classifier to the agent loop. This skill briefs the user on
 its capabilities and installs or updates it. The installer also installs the
-Claude Code, Codex, Hermes, Qwen Code and Antigravity ports when their CLIs are present.
+Claude Code, Codex, Hermes, Qwen Code, Antigravity, Pi and MiMo Code ports when
+their CLIs are present.
 
 ## Locate the installer
 
@@ -34,8 +35,8 @@ git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
   *high*; `maxTokens` is set per level and medium/high prompts get a system
   note suggesting a confidence check before committing to a solution.
 - **Automatic effort control**: the level is written into every primary model
-  request in the dialect the requested model actually speaks — Claude
-  (`output_config.effort`), GPT reasoning models (`reasoning.effort` /
+  request in the dialect the requested model actually speaks. Wired dialects:
+  Claude (`output_config.effort`), GPT reasoning models (`reasoning.effort` /
   `reasoning_effort`), GLM-5.2+ (`thinking.type` + `reasoning_effort`), Xiaomi
   MiMo V2.5+ (`thinking.type`, or `reasoning.effort` / `reasoning_effort` on
   the Responses API and gateway routes), Google Gemini 3+ (`thinkingLevel`, or
@@ -60,22 +61,22 @@ git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
   (read/search/edit/shell/task) plus `reflex_run`, so the model keeps its direct
   tools and only the long tail (web, exec, subagents…) is trimmed to what the
   task clearly needs or the model already used this session. Everything is
-  exposed if the classifier is unavailable. Only
-  works where the agent can drop tools from the model request (OpenCode and Pi);
-  the shell-hook agents can only deny a call after the model already chose the
-  tool, which saves no tokens, so they do not get it.
+  exposed if the classifier is unavailable.
 - **Tool dispatch** (`reflex_run`): an optional fallback tool for when the model
   cannot decide which underlying tool a task needs. It asks the decision model
   which tool to use (a `choice` decision), runs it, and returns its real output.
   The model calls tools directly whenever it already knows which one fits and
   reaches for `reflex_run` only when the correct tool is unclear. The shell
-  guardrail runs before dispatch. On OpenCode and Pi. Tool dispatch uses the
-  same configured classifier model as the rest of the plugin.
+  guardrail runs before dispatch. Tool dispatch uses the same configured
+  classifier model as the rest of the plugin.
 - **Shell guardrail**: shell commands are scored for damage potential;
   dangerous ones are denied.
 - **Syntax checks**: after `edit`/`write` the file is checked with language
   parsers (plus a classifier bug check on medium/high), with one retry and
   then an ask-the-user stop.
+
+Which features actually reach the agent — and with what caveat — is per agent:
+see the support table below.
 
 The classifier needs a System One endpoint at `<baseURL>/systemone`: local
 llama.cpp/Ollama (0.35+)/LM Studio (0.4.26+), or TypeSafe's Jev through the
@@ -83,17 +84,19 @@ TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen. A
 `fallbackModel` option retries the classifier when the primary model rejects
 requests (e.g. a free-model window closing).
 
-## Agent support (Claude Code, Codex, Hermes, Qwen Code, Antigravity, Pi, MiMo Code)
+## Agent support
 
-The same features run in Claude Code (`plugins/claude-code`), Codex
+Eight agents are supported: OpenCode (the reference) plus the ports below. The
+same features run in Claude Code (`plugins/claude-code`), Codex
 (`plugins/codex`), Hermes (`plugins/hermes`), Qwen Code (`plugins/qwen-code`),
 Antigravity (`plugins/antigravity`), Pi (`plugins/pi`) and MiMo Code
-(`plugins/mimocode`) as plugins, which the installer sets up when each CLI is
+(`plugins/mimocode`), which the installer sets up when each CLI is
 present. The classifier config is shared (`agent-reflex.jsonc`, same option
 names), so the user answers the classifier questions once.
 
-The two features that require rewriting the model request — dynamic effort and
-custom history pruning — only reach agents whose hook API can do that:
+Which features reach each agent — and with what caveat — is in the table below.
+The two features that require rewriting the model request (dynamic effort and
+custom history pruning) only reach agents whose hook API can do that:
 
 | Agent | Guardrail | Post-edit checks | Compaction guidance | Dynamic effort | History pruning | Tool exposure | Tool dispatch | Key caveat |
 |---|---|---|---|---|---|---|---|---|
