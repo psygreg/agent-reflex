@@ -61,28 +61,31 @@ TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen. A
 `fallbackModel` option retries the classifier when the primary model rejects
 requests (e.g. a free-model window closing).
 
-## Claude Code, Codex, Hermes, Qwen Code, Antigravity, Pi and MiMo Code ports
+## Agent support (Claude Code, Codex, Hermes, Qwen Code, Antigravity, Pi, MiMo Code)
 
 The same features run in Claude Code (`plugins/claude-code`), Codex
 (`plugins/codex`), Hermes (`plugins/hermes`), Qwen Code (`plugins/qwen-code`),
 Antigravity (`plugins/antigravity`), Pi (`plugins/pi`) and MiMo Code
 (`plugins/mimocode`) as plugins, which the installer sets up when each CLI is
-present. On most of these, two features are OpenCode-only because their hooks cannot
-rewrite the model request: per-request dynamic effort/`maxTokens`, and custom history
-pruning. **Pi is the exception** — its extension API can rewrite both the request and
-the message list, so Pi carries the full feature set (dynamic effort via
-`setThinkingLevel`, and opt-in history pruning). **MiMo Code is a near-exception** —
-it is OpenCode-derived with the same plugin API, so it carries `maxTokens` (via
-`chat.params`) and opt-in history pruning (via `experimental.chat.messages.transform`),
-but `chat.params` exposes no `reasoning_effort`, so effort there is the token cap
-only, not the thinking knob. Additional per-agent caveats: Codex has no way to steer
-what compaction keeps (Claude Code, Qwen Code and MiMo Code can), so the Codex
-compaction hook is inert by default; Hermes hooks cannot block a tool call, so its
-guardrail is a `safe_run` command-execution wrapper rather than a hook, and it cannot
-prune history (only read it); Antigravity delivers post-edit check findings one turn
-late (its `PostToolUse` cannot inject context) and has no compaction steering. The
-classifier config is shared (`agent-reflex.jsonc`, same option names), so the user
-answers the classifier questions once.
+present. The classifier config is shared (`agent-reflex.jsonc`, same option
+names), so the user answers the classifier questions once.
+
+The two features that require rewriting the model request — dynamic effort and
+custom history pruning — only reach agents whose hook API can do that:
+
+| Agent | Guardrail | Post-edit checks | Compaction guidance | Dynamic effort | History pruning | Key caveat |
+|---|---|---|---|---|---|---|
+| OpenCode | hard block | inline | built-in | full (per-model dialects) | pruning | Reference implementation; everything works. |
+| Pi | hard block | inline | via `context` | full (`setThinkingLevel`) | opt-in | Pi translates the effort level per model itself. |
+| MiMo Code | hard block | inline | compacting hook | token cap only | opt-in | `chat.params` has `maxTokens` but no `reasoning_effort`. |
+| Claude Code | hard block | inline | `custom_instructions` | no | no | Hooks cannot rewrite the request or the message list. |
+| Qwen Code | hard block | inline | `custom_instructions` | no | no | Same hook limits as Claude Code. |
+| Codex | hard block | inline | inert | no | no | Compaction hook can only cancel compaction; edits via `apply_patch` (V4A). |
+| Antigravity | hard block | one turn late | inert | no | no | `PostToolUse` cannot inject context (antigravity-cli#808). |
+| Hermes | wrapper tool | inline | none | no | no | Hooks cannot block a tool call; guardrail is a `safe_run` wrapper. |
+
+When installing or updating, tell the user which caveats apply to their agent and
+point them at the port's own README (`plugins/<agent>/README.md`) for details.
 
 ## Updating an existing installation
 

@@ -9,19 +9,33 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 ### What works
 - Local system one decision models through llama.cpp (0.6 onwards), Ollama (0.35 onwards) and LM Studio (0.4.26 onwards), all serving the same System One endpoint at `<baseURL>/systemone`
 - TypeSafe Jev and other System One decision models as the classifier, through the TypeSafe API directly, OpenRouter, the Vercel AI Gateway or OpenCode Zen
-- Use with OpenCode v2 agent
-- Use with Claude Code: shell guardrail, post-edit syntax/bug checks, complexity classification, and a confidence check as a Claude Code plugin. Per-request dynamic effort and custom history pruning stay OpenCode-only because Claude Code hooks cannot rewrite model requests.
-- Use with Codex (see `plugins/codex`): the same portable features as a Codex plugin. Per-request dynamic effort and custom history pruning stay OpenCode-only, and Codex additionally cannot steer what compaction keeps (its `PreCompact` hook is inert by default).
-- Use with Hermes (see `plugins/hermes`): a `safe_run` command wrapper that blocks dangerous commands before they run, post-edit checks, complexity classification, and a confidence check. Per-request dynamic effort and history pruning stay OpenCode-only; the guardrail is a wrapper tool because Hermes hooks cannot block a tool call.
-- Use with Qwen Code (see `plugins/qwen-code`): the same portable features as a Claude Code plugin (shell guardrail, post-edit checks, complexity classification, compaction guidance, confidence check) as a Qwen Code extension. Per-request dynamic effort and history pruning stay OpenCode-only because Qwen Code hooks cannot rewrite model requests.
-- Use with Antigravity (see `plugins/antigravity`): a shell guardrail (hard block), post-edit checks, complexity classification, and a confidence check as an Antigravity plugin. Post-edit findings reach the model one turn later (Antigravity's `PostToolUse` cannot inject context). Per-request dynamic effort and history pruning stay OpenCode-only.
-- Use with Pi (see `plugins/pi`): the **full** feature set — dynamic thinking effort (via Pi's native `setThinkingLevel`), custom history pruning (opt-in), a shell guardrail (hard block), post-edit checks, complexity classification, and a confidence check. Pi is the only non-OpenCode agent where effort and pruning both work, because its extension API can rewrite the request and the message list.
-- Use with MiMo Code (see `plugins/mimocode`): a shell guardrail (hard block), post-edit checks (inline), complexity classification, per-request `maxTokens`, custom history pruning (opt-in), compaction guidance, and a confidence check — all via MiMo Code's OpenCode-derived file hooks. Caveat: `chat.params` exposes `maxTokens` but not `reasoning_effort`, so effort is token-cap only (no thinking knob).
 - Decision-driven history compaction
 - Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp, Ollama, OpenAI GPT reasoning models, Z.ai GLM models (GLM-5.2 onwards), Xiaomi MiMo models (MiMo-V2.5 onwards), Google Gemini models (Gemini 3 onwards), Qwen models (Qwen3.5 onwards and the qwen-plus/qwen-max aliases) and Moonshot Kimi models (kimi-k2.7+/kimi-k3) in accordance. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin
 - Confidence level tool: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check for the confidence level of its current line of thinking before finalizing a response and correct itself in the way if needed
 - Up to two-step syntax checks after `edit` and `write` tool calls using parsers and decision model
 - Shell command check guardrail against commands that may cause damage to a repository or remove files without backup
+
+### Agent support
+
+Eight agents are supported. The classifier config is shared across all of them
+(`agent-reflex.jsonc`, same option names), so the classifier questions are answered
+once. The two features that require the plugin to rewrite the model request — dynamic
+effort and custom history pruning — only reach agents whose hook API can do that.
+
+| Agent | Shell guardrail | Post-edit checks | Classify + confidence | Compaction guidance | Dynamic effort | History pruning | Notes |
+|---|---|---|---|---|---|---|---|
+| **OpenCode** | ✅ hard block | ✅ inline | ✅ | ✅ built-in | ✅ full (per-model dialects) | ✅ pruning | Reference implementation and the only agent where everything works. |
+| **Pi** | ✅ hard block | ✅ inline | ✅ | ✅ via `context` | ✅ full (`setThinkingLevel`) | ✅ opt-in pruning | Pi translates the unified effort level per model itself, so no per-vendor dialect code is needed. |
+| **MiMo Code** | ✅ hard block | ✅ inline | ✅ | ✅ compacting hook | ⚠️ token cap only | ✅ opt-in pruning | OpenCode-derived. `chat.params` sets `maxTokens` but not `reasoning_effort`, so effort cannot change how hard the model thinks. |
+| **Claude Code** | ✅ hard block | ✅ inline | ✅ | ✅ `custom_instructions` | ❌ | ❌ | Hooks cannot rewrite the model request or return a pruned message list. |
+| **Qwen Code** | ✅ hard block | ✅ inline | ✅ | ✅ `custom_instructions` | ❌ | ❌ | Same hook limits as Claude Code. Strongest of the shell-hook ports. |
+| **Codex** | ✅ hard block | ✅ inline | ✅ | ❌ inert | ❌ | ❌ | No `PreCompact` `custom_instructions`; its compaction hook can only cancel compaction. Edits arrive via `apply_patch` (V4A). |
+| **Antigravity** | ✅ hard block | ⚠️ one turn late | ✅ | ❌ inert | ❌ | ❌ | `PostToolUse` cannot inject context (open upstream antigravity-cli#808), so findings queue and surface at the next model call. |
+| **Hermes** | ⚠️ wrapper tool | ✅ inline | ✅ | ❌ none | ❌ | ❌ | Hooks cannot block a tool call, so the guardrail is a `safe_run` wrapper over `terminal`. No compaction hook. |
+
+Legend: ✅ works · ⚠️ works with a documented compromise · ❌ not possible (agent hook
+API limitation). Dynamic effort means both the reasoning/thinking level and the
+per-level `maxTokens` cap where the agent exposes one.
 
 ## Usage
 Install the skill using `npx skills add psygreg/agent-reflex` or `bun x skills add psygreg/agent-reflex` then ask your agent to do it: the skill briefs the agent on the plugin's capabilities and installs or updates it — updates need no answers (`bash install.sh </dev/null`), fresh installs collect the answers in chat and pipe them in.
@@ -41,4 +55,4 @@ For development, add a `"debugLog":` key to the plugin's options pointing to a f
 ## TO-DO
 - Add automatic effort changing capabilities for local models running through LM Studio (blocked upstream: its OpenAI-compatible endpoint documents no reasoning field yet)
 - Add automatic effort changing capabilities for other providers beyond the wired dialects (Anthropic, GPT, GLM, MiMo, Gemini, Qwen, Kimi)
-- Use with other agents (Claude Code, Codex, Hermes, Qwen Code, Antigravity, Pi and MiMo Code are done)
+- Port to further agents (Claude Code, Codex, Hermes, Qwen Code, Antigravity, Pi and MiMo Code are done)
