@@ -1,0 +1,56 @@
+{
+  "description": "agent-reflex: System One guardrail, post-edit checks, complexity classification, and compaction guidance for Codex.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/scripts/guard.sh\"",
+            "statusMessage": "Scoring command for damage potential",
+            "timeout": 45
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/scripts/check.sh\"",
+            "statusMessage": "Checking edited files",
+            "timeout": 45
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/scripts/classify.sh\"",
+            "statusMessage": "Scoring prompt complexity",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "auto|manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/scripts/compact.sh\"",
+            "statusMessage": "Guiding compaction",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

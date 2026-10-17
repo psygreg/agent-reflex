@@ -19,6 +19,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_SRC="$REPO_DIR/plugins/opencode"
 CC_PLUGIN_SRC="$REPO_DIR/plugins/claude-code"
+CX_PLUGIN_SRC="$REPO_DIR/plugins/codex"
 SKILL_SRC="$REPO_DIR/.agents/skills/agent-reflex"
 
 # The global OpenCode config lives in ~/.config/opencode (XDG) or, with some
@@ -146,93 +147,95 @@ install_skill() {
 }
 
 # ---------------------------------------------------------------
-# CLAUDE CODE PORT (plugins/claude-code).
+# AGENT PORTS (plugins/claude-code, plugins/codex).
 # ---------------------------------------------------------------
-# Claude Code plugins load from a local directory or a marketplace. This
-# installer keeps one installation path: it copies the plugin into the user's
-# ~/.claude/plugins source directory and, when the claude CLI is available,
-# registers it there so hooks load. The classifier config is written to
-# agent-reflex.jsonc in the plugin root (same option names as the OpenCode
-# plugin), so the user configures the classifier once and both agents share it.
-CC_DEST="$HOME/.claude/plugins/agent-reflex"
-CC_CONFIG="$CC_DEST/agent-reflex.jsonc"
+# Both agent plugins load from a local directory or a marketplace. This
+# installer keeps one installation path per agent: it copies the plugin into the
+# agent's plugins directory and, when that agent's CLI is available, registers it
+# so hooks load. The classifier config is written to agent-reflex.jsonc in each
+# plugin root (same option names as the OpenCode plugin), so the user configures
+# the classifier once and every agent shares it.
+#
+# install_agent_port SRC DEST LABEL CLI_CMD...
+#   SRC        repo plugin source dir
+#   DEST       installed plugin dir (contains agent-reflex.jsonc)
+#   LABEL      display name (Claude Code, Codex, ...)
+#   CLI_CMD... command prefix to register the plugin (empty => copy only)
+install_agent_port() {
+  local src="$1" dest="$2" label="$3"; shift 3
+  local cfg="$dest/agent-reflex.jsonc"
+  [ -d "$src" ] || { warn "plugins/${src##*/} not found — skipping ${label} install."; return 0; }
 
-update_cc_files() {
-  [ -d "$CC_PLUGIN_SRC" ] || return 0
-  mkdir -p "$CC_DEST"
-  # Preserve an existing classifier config across the copy (the source tree has
-  # no agent-reflex.jsonc, but a future sample must never clobber the real one).
+  # Copy plugin files, preserving an existing classifier config across the copy.
+  mkdir -p "$dest"
   local keep=""
-  if [ -f "$CC_CONFIG" ]; then
+  if [ -f "$cfg" ]; then
     keep="$(mktemp)"
-    cp "$CC_CONFIG" "$keep"
+    cp "$cfg" "$keep"
   fi
-  cp -R "$CC_PLUGIN_SRC"/. "$CC_DEST"/
+  cp -R "$src"/. "$dest"/
   if [ -n "$keep" ]; then
-    cp "$keep" "$CC_CONFIG"
+    cp "$keep" "$cfg"
     rm -f "$keep"
   fi
-  chmod +x "$CC_DEST"/scripts/*.sh 2>/dev/null || true
-  msg "Claude Code plugin files copied to ${DIM}${CC_DEST}${RESET}"
-}
+  chmod +x "$dest"/scripts/*.sh 2>/dev/null || true
+  msg "${label} plugin files copied to ${DIM}${dest}${RESET}"
 
-# Writes agent-reflex.jsonc from the same classifier answers used for OpenCode,
-# but only when absent — an existing config is left untouched. When the answers
-# are not available (update mode), the file is simply left alone.
-write_cc_config() {
-  [ -n "${1:-}" ] || return 0           # provider (empty => update mode, skip)
-  if [ -f "$CC_CONFIG" ]; then
-    msg "Claude Code classifier config left untouched (${DIM}${CC_CONFIG}${RESET})"
-    return 0
-  fi
-  mkdir -p "$CC_DEST"
-  {
-    echo "{"
-    echo "  // System One classifier shared with the OpenCode plugin."
-    echo "  // Option names match plugins/opencode (provider/baseURL/model/apiKey/...)."
-    printf '  "provider": "%s",\n' "$1"
-    [ -n "${2:-}" ] && printf '  "baseURL": "%s",\n' "$2"
-    [ -n "${3:-}" ] && printf '  "model": "%s",\n' "$3"
-    [ -n "${4:-}" ] && printf '  "apiKey": "%s",\n' "$4"
-    [ -n "${5:-}" ] && printf '  "fallbackModel": "%s",\n' "$5"
-    [ -n "${6:-}" ] && printf '  "debugLog": "%s",\n' "$6"
-    echo "}"
-  } > "$CC_CONFIG" 2>/dev/null
-  # Trim a possible trailing comma on the last line before "}".
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$CC_CONFIG" <<'PY' 2>/dev/null || true
+  # Write the shared classifier config when absent (a non-empty $1 = provider is
+  # passed via _AR_PROVIDER from the caller; empty means update mode, skip).
+  if [ -n "${_AR_PROVIDER:-}" ] && [ ! -f "$cfg" ]; then
+    mkdir -p "$dest"
+    {
+      echo "{"
+      echo "  // System One classifier shared with the OpenCode plugin."
+      echo "  // Option names match plugins/opencode (provider/baseURL/model/apiKey/...)."
+      printf '  "provider": "%s",\n' "$_AR_PROVIDER"
+      [ -n "${_AR_BASEURL:-}" ] && printf '  "baseURL": "%s",\n' "$_AR_BASEURL"
+      [ -n "${_AR_MODEL:-}" ] && printf '  "model": "%s",\n' "$_AR_MODEL"
+      [ -n "${_AR_APIKEY:-}" ] && printf '  "apiKey": "%s",\n' "$_AR_APIKEY"
+      [ -n "${_AR_FALLBACK:-}" ] && printf '  "fallbackModel": "%s",\n' "$_AR_FALLBACK"
+      [ -n "${_AR_DEBUG:-}" ] && printf '  "debugLog": "%s",\n' "$_AR_DEBUG"
+      echo "}"
+    } > "$cfg" 2>/dev/null
+    # Trim a possible trailing comma before } or ].
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "$cfg" <<'PY' 2>/dev/null || true
 import re, sys
 p = sys.argv[1]; s = open(p, encoding="utf-8").read()
 s = re.sub(r',(\s*[}\]])', r'\1', s)
 open(p, "w", encoding="utf-8").write(s)
 PY
+    fi
+    msg "${label} classifier config written to ${DIM}${cfg}${RESET}"
+  elif [ -f "$cfg" ]; then
+    msg "${label} classifier config left untouched (${DIM}${cfg}${RESET})"
   fi
-  msg "Claude Code classifier config written to ${DIM}${CC_CONFIG}${RESET}"
-}
 
-# Registers the plugin with the claude CLI when present. The exact install
-# command varies by CLI version, so this tries the plugin-dir route and, if the
-# CLI is absent or the command differs, prints clear manual steps instead of
-# failing the whole install.
-install_cc() {
-  [ -d "$CC_PLUGIN_SRC" ] || { warn "plugins/claude-code not found — skipping Claude Code install."; return 0; }
-  update_cc_files
-  if ! command -v claude >/dev/null 2>&1; then
-    warn "Claude Code CLI (claude) not found — plugin files are copied to"
-    warn "  ${CC_DEST}"
-    warn "but not registered. Enable it from Claude Code with:"
-    warn "  claude plugin install ${CC_DEST}"
+  # Register with the agent CLI when present; otherwise print manual steps.
+  [ "$#" -gt 0 ] || return 0
+  if ! command -v "$1" >/dev/null 2>&1; then
+    warn "${label} CLI ($1) not found — plugin files are copied to"
+    warn "  ${dest}"
+    warn "but not registered. Register it manually:"
+    warn "  $* ${dest}"
     return 0
   fi
   local out
-  if out=$(claude plugin install "$CC_DEST" 2>&1); then
-    msg "Claude Code plugin registered through the claude CLI."
+  if out=$("$@" "$dest" 2>&1); then
+    msg "${label} plugin registered through the $1 CLI."
   else
-    warn "Claude Code plugin copied but not registered (the claude CLI install"
-    warn "command differed). Register it manually from Claude Code:"
-    warn "  claude plugin install ${CC_DEST}"
+    warn "${label} plugin copied but not registered (the $1 install command"
+    warn "differed). Register it manually:"
+    warn "  $* ${dest}"
     printf '%s\n' "$out" | sed 's/^/  /'
   fi
+}
+
+install_agent_ports() {
+  # Claude Code: register via `claude plugin install <dir>`.
+  install_agent_port "$CC_PLUGIN_SRC" "$HOME/.claude/plugins/agent-reflex" "Claude Code" claude plugin install
+  # Codex: register via `codex plugin install <dir>`.
+  install_agent_port "$CX_PLUGIN_SRC" "$HOME/.codex/plugins/agent-reflex" "Codex" codex plugin install
 }
 
 # ---------------------------------------------------------------
@@ -241,7 +244,7 @@ install_cc() {
 if [ -f "$PLUGIN_DEST/index.ts" ] || { [ -n "$CONFIG_FILE" ] && grep -q 'plugins/reflex' "$CONFIG_FILE"; }; then
   update_files
   install_skill
-  install_cc
+  install_agent_ports
   msg "Existing installation detected — options left untouched."
   msg "Restart OpenCode ${BOLD}(opencode service restart)${RESET} to reload the plugin."
   exit 0
@@ -344,9 +347,11 @@ ask debugLog "${BOLD}Debug log file for outgoing request bodies${RESET} ${DIM}(o
 update_files
 install_skill
 
-# Claude Code port: register the plugin, then write the shared classifier config.
-install_cc
-write_cc_config "$provider" "$baseURL" "$model" "$apiKey" "$fallbackModel" "$debugLog"
+# Agent ports: register each plugin and write its shared classifier config. The
+# answers collected above are passed via _AR_* so every agent shares one config.
+_AR_PROVIDER="$provider" _AR_BASEURL="$baseURL" _AR_MODEL="$model" \
+_AR_APIKEY="$apiKey" _AR_FALLBACK="$fallbackModel" _AR_DEBUG="$debugLog" \
+  install_agent_ports
 
 make_entry() {
   PLUGIN_PROVIDER="$provider" \
@@ -486,7 +491,7 @@ fi
 if [ "$merged" = 1 ]; then
   echo
   msg "${BOLD}${GREEN}Installed.${RESET} Restart OpenCode ${BOLD}(opencode service restart)${RESET} to load the plugin."
-  msg "The Claude Code port is at ${DIM}${CC_DEST}${RESET} — enable it from Claude Code if it is not already registered."
+  msg "The Claude Code and Codex ports are under ${DIM}~/.claude/plugins/agent-reflex${RESET} and ${DIM}~/.codex/plugins/agent-reflex${RESET} — register them with their CLIs if not already enabled."
 else
   manual_entry
 fi

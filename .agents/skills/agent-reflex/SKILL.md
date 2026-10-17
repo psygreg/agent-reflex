@@ -8,7 +8,7 @@ description: Brief on the agent-reflex plugin's capabilities, and install or upd
 An OpenCode plugin that adds a small System One decision model (Jev, nimble, d1,
 liquid-d1...) as a classifier to the agent loop. This skill briefs the user on
 its capabilities and installs or updates it. The installer also installs the
-Claude Code port when the `claude` CLI is present.
+Claude Code and Codex ports when their CLIs are present.
 
 ## Locate the installer
 
@@ -61,14 +61,17 @@ TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen. A
 `fallbackModel` option retries the classifier when the primary model rejects
 requests (e.g. a free-model window closing).
 
-## Claude Code port
+## Claude Code and Codex ports
 
-The same features run in Claude Code as a plugin (`plugins/claude-code`), which
-the installer sets up when the `claude` CLI is available. Two features are
-OpenCode-only because Claude Code hooks cannot rewrite the model request:
-per-request dynamic effort/`maxTokens`, and custom history pruning. The
-classifier config is shared (`agent-reflex.jsonc`, same option names), so the
-user answers the classifier questions once.
+The same features run in Claude Code (`plugins/claude-code`) and Codex
+(`plugins/codex`) as plugins, which the installer sets up when each CLI is
+present. Two features are OpenCode-only because neither agent's hooks can rewrite
+the model request: per-request dynamic effort/`maxTokens`, and custom history
+pruning. A third is reduced in Codex: it has no way to steer what compaction keeps
+(Claude Code can, via `PreCompact` `custom_instructions`), so the Codex
+compaction hook is inert by default. The classifier config is shared
+(`agent-reflex.jsonc`, same option names), so the user answers the classifier
+questions once.
 
 ## Updating an existing installation
 
@@ -83,7 +86,8 @@ bash ../../../install.sh </dev/null
 - Only the plugin files are refreshed (in `~/.config/opencode/plugins/reflex/`
   or next to the config that references it); the configured options are left
   untouched. The Claude Code plugin files under `~/.claude/plugins/agent-reflex/`
-  are refreshed too, and its `agent-reflex.jsonc` is left untouched.
+  and the Codex plugin files under `~/.codex/plugins/agent-reflex/`
+  are refreshed too, and their `agent-reflex.jsonc` is left untouched.
 - If it instead prints the setup menu and ends with "No input available
   (stdin closed)", there is no installation yet — follow the fresh-install
   section below.

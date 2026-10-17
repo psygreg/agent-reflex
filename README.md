@@ -11,6 +11,7 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - TypeSafe Jev and other System One decision models as the classifier, through the TypeSafe API directly, OpenRouter, the Vercel AI Gateway or OpenCode Zen
 - Use with OpenCode v2 agent
 - Use with Claude Code: shell guardrail, post-edit syntax/bug checks, complexity classification, and a confidence check as a Claude Code plugin. Per-request dynamic effort and custom history pruning stay OpenCode-only because Claude Code hooks cannot rewrite model requests.
+- Use with Codex (see `plugins/codex`): the same portable features as a Codex plugin. Per-request dynamic effort and custom history pruning stay OpenCode-only, and Codex additionally cannot steer what compaction keeps (its `PreCompact` hook is inert by default).
 - Decision-driven history compaction
 - Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp, Ollama, OpenAI GPT reasoning models, Z.ai GLM models (GLM-5.2 onwards), Xiaomi MiMo models (MiMo-V2.5 onwards), Google Gemini models (Gemini 3 onwards), Qwen models (Qwen3.5 onwards and the qwen-plus/qwen-max aliases) and Moonshot Kimi models (kimi-k2.7+/kimi-k3) in accordance. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin
 - Confidence level tool: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check for the confidence level of its current line of thinking before finalizing a response and correct itself in the way if needed
@@ -35,4 +36,4 @@ For development, add a `"debugLog":` key to the plugin's options pointing to a f
 ## TO-DO
 - Add automatic effort changing capabilities for local models running through LM Studio (blocked upstream: its OpenAI-compatible endpoint documents no reasoning field yet)
 - Add automatic effort changing capabilities for other providers beyond the wired dialects (Anthropic, GPT, GLM, MiMo, Gemini, Qwen, Kimi)
-- Use with other agents like Hermes, Codex and Qwen Code
+- Use with other agents like Hermes and Qwen Code (Claude Code and Codex are done)
