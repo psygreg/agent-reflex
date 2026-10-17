@@ -24,6 +24,7 @@ HX_PLUGIN_SRC="$REPO_DIR/plugins/hermes"
 QX_PLUGIN_SRC="$REPO_DIR/plugins/qwen-code"
 AX_PLUGIN_SRC="$REPO_DIR/plugins/antigravity"
 PX_PLUGIN_SRC="$REPO_DIR/plugins/pi"
+MX_PLUGIN_SRC="$REPO_DIR/plugins/mimocode"
 SKILL_SRC="$REPO_DIR/.agents/skills/agent-reflex"
 
 # The global OpenCode config lives in ~/.config/opencode (XDG) or, with some
@@ -256,6 +257,65 @@ install_agent_ports() {
   # Pi: copy into the extensions dir (auto-discovered by index.ts at the extension
   # root, no install command and no enable gate). Pi loads it via its jiti TS loader.
   install_agent_port "$PX_PLUGIN_SRC" "$HOME/.pi/agent/extensions/agent-reflex" "Pi"
+  install_mimocode_port
+}
+
+# MiMo Code is file-hook based: it loads hooks/*.ts and tools/*.ts from its config
+# dirs (the "plugin" array does NOT execute module code). So the hook module and its
+# two helpers go in hooks/, the confidence tool in tools/, and the classifier config
+# next to the hooks. Mirrors install_agent_port's config-preservation rules.
+install_mimocode_port() {
+  local src="$MX_PLUGIN_SRC"
+  [ -d "$src" ] || { warn "plugins/mimocode not found — skipping MiMo Code install."; return 0; }
+
+  local hooks_dir="$HOME/.config/mimocode/hooks"
+  local tools_dir="$HOME/.config/mimocode/tools"
+  local cfg="$hooks_dir/agent-reflex.jsonc"
+
+  mkdir -p "$hooks_dir" "$tools_dir"
+  # Preserve an existing classifier config across the copy.
+  local keep=""
+  if [ -f "$cfg" ]; then
+    keep="$(mktemp)"
+    cp "$cfg" "$keep"
+  fi
+  cp "$src"/index.ts "$src"/classifier.ts "$src"/check.ts "$hooks_dir"/
+  cp "$src"/tools.ts "$tools_dir"/agent-reflex-confidence.ts
+  rm -f "$hooks_dir"/test.ts "$tools_dir"/test.ts 2>/dev/null || true
+  if [ -n "$keep" ]; then
+    cp "$keep" "$cfg"
+    rm -f "$keep"
+  fi
+  msg "MiMo Code hook files copied to ${DIM}${hooks_dir}${RESET} and ${DIM}${tools_dir}${RESET}"
+
+  # Write the shared classifier config when absent (a non-empty _AR_PROVIDER means
+  # fresh install; empty means update mode, skip).
+  if [ -n "${_AR_PROVIDER:-}" ] && [ ! -f "$cfg" ]; then
+    {
+      echo "{"
+      echo "  // System One classifier shared with the OpenCode plugin."
+      echo "  // Option names match plugins/opencode (provider/baseURL/model/apiKey/...)."
+      printf '  "provider": "%s",\n' "$_AR_PROVIDER"
+      [ -n "${_AR_BASEURL:-}" ] && printf '  "baseURL": "%s",\n' "$_AR_BASEURL"
+      [ -n "${_AR_MODEL:-}" ] && printf '  "model": "%s",\n' "$_AR_MODEL"
+      [ -n "${_AR_APIKEY:-}" ] && printf '  "apiKey": "%s",\n' "$_AR_APIKEY"
+      [ -n "${_AR_FALLBACK:-}" ] && printf '  "fallbackModel": "%s",\n' "$_AR_FALLBACK"
+      [ -n "${_AR_DEBUG:-}" ] && printf '  "debugLog": "%s",\n' "$_AR_DEBUG"
+      echo "}"
+    } > "$cfg" 2>/dev/null
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "$cfg" <<'PY' 2>/dev/null || true
+import re, sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+s = re.sub(r',(\s*[}\]])', r'\1', s)
+open(p, "w", encoding="utf-8").write(s)
+PY
+    fi
+    msg "MiMo Code classifier config written to ${DIM}${cfg}${RESET}"
+  elif [ -f "$cfg" ]; then
+    msg "MiMo Code classifier config left untouched (${DIM}${cfg}${RESET})"
+  fi
+  msg "MiMo Code loads these automatically (file hooks); restart it if they were already open."
 }
 
 # Adds "agent-reflex" to plugins.enabled in ~/.hermes/config.yaml (creating the
