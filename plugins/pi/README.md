@@ -34,10 +34,19 @@ your classifier settings.
   suggesting a confidence check on medium/high.
 - **Tool exposure** (`before_agent_start`): decides which tools the task needs
   and narrows the active set with `pi.setActiveTools()`, so the request carries
-  fewer tool schemas and saves input tokens. A core set (read, grep, glob, edit,
-  write, bash, shell, task…) and any tool already used this session are always
-  kept, and everything stays exposed if the classifier is unavailable. Disable
-  with `AGENT_REFLEX_TOOLS=0`.
+  fewer tool schemas and saves input tokens. The always-keep set is the common
+  core (read/search/edit/shell/task) plus `reflex_run`, so the model keeps the
+  direct tools it reaches for constantly and only the long tail (web, exec,
+  subagents…) is trimmed to what the task clearly needs or the model already used
+  this session. Everything stays exposed if the classifier is
+  unavailable. Disable with `AGENT_REFLEX_TOOLS=0`.
+- **Tool dispatch** (`reflex_run` tool): an optional fallback for when the model
+  cannot decide which underlying tool a task needs. It asks the decision model
+  which tool to use (a `choice` decision), runs it via `ctx.executeTool`, and
+  returns its real output. The model calls tools directly whenever it already
+  knows which one fits and reaches for `reflex_run` only when the correct tool is
+  unclear. The shell guardrail runs before dispatch. Tool dispatch uses the same
+  configured classifier model.
 - **Confidence check** (`confidence_check` tool and `/confidence` command): scores
   the model's current line of thought and returns CONTINUE or RESTART.
 

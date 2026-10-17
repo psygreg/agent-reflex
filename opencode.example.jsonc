@@ -34,10 +34,12 @@
     //   apiKey         Optional Bearer token. Use "{env:NAME}" instead of a literal key.
     //   debugLog       Optional file path. Appends each primary request body after rewrites.
     //   tools          Tool exposure: "auto" (default) narrows the tool set to what
-    //                  each prompt needs (saving input tokens); "all" keeps every
-    //                  tool exposed. A core set and any tool already used this
-    //                  session are always kept, and everything is kept if the
-    //                  classifier is unavailable.
+    //                  each prompt needs (saving input tokens). The common core
+    //                  (read/search/edit/shell/task) plus reflex_run is always kept,
+    //                  so the model keeps its direct tools and only the long tail
+    //                  (web, exec, subagents…) is trimmed to what the task needs or
+    //                  the model already used. "all" keeps every tool exposed.
+    //                  Everything is kept if the classifier is unavailable.
 
     // Classifier on a local llama.cpp server with the System One API (/systemone).
     // Effort control is automatic: every model that supports it gets effort written

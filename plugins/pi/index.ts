@@ -17,7 +17,7 @@
 //   - tool_result: post-edit syntax + bug check, findings appended to the result.
 //   - confidence_check tool + /confidence command: on-demand confidence scoring.
 
-import { arAsk, arAskMany, classifyLevel, config, arLog } from "./classifier";
+import { arAsk, arAskMany, arAskChoice, classifyLevel, config, arLog } from "./classifier";
 import { findSyntaxErrors, excerptAroundEdit, readFileText, CONTEXT_LINES } from "./check";
 
 // Complexity -> Pi thinking level. simple disables thinking where the model
@@ -69,19 +69,32 @@ const LEVEL_MAX_TOKENS: Record<string, number> = { simple: 8192, medium: 65536, 
 // "all"). The decision is driven by System One and always fails open (keeps every
 // tool) on any classifier error, and never drops an always-keep core tool or one
 // the model has already used this session.
+//
+// Filtering stays conservative: the always-keep core is the common direct tools
+// (read/search/edit/shell/task), so the model keeps the tools it reaches for
+// constantly and only the long tail (web, exec, subagents, …) is trimmed to what
+// the task clearly needs or the model already used this session. reflex_run (the
+// decision-model dispatch tool) is an optional fallback and is likewise kept, so
+// the model can reach for it when it cannot decide which tool to call — it is not
+// relied on as the default path.
 const TOOL_EXPOSURE_ENABLED = (process.env.AGENT_REFLEX_TOOLS ?? "auto") === "auto";
 const TOOL_RELEVANCE_THRESHOLD = 0.35;
 
-// Always-keep core: never removed regardless of the classifier, so the model can
-// always find/read/search and reach the essential actions.
-const TOOL_CORE = new Set(["read", "grep", "glob", "edit", "write", "bash", "shell", "task", "ls", "find"]);
+// Always-keep core: the common direct tools (find/read/search/edit/shell/task) are
+// never removed, so the model always has the tools it reaches for most. reflex_run
+// is kept as the optional fallback dispatch path and is never removed either.
+const TOOL_CORE = new Set(["read", "grep", "glob", "edit", "write", "bash", "shell", "task", "reflex_run"]);
 
 // Fallback tiers when the per-tool batch is unsupported (backend answers one
 // question). Each tier is a matcher over the tool name; everything outside it is
-// removed. Ordered narrow (read-only) -> wide (everything).
+// removed. Ordered narrow -> wide. FULL keeps everything (the long tail is not
+// assumed reachable via reflex_run).
 const TOOL_TIERS: Array<(name: string) => boolean> = [
+  // READ: inspect/search only.
   (n) => /^(read|grep|glob|ls|list|find)$/.test(n) || /_?(read|search|find|list|grep|glob)$/.test(n),
+  // EDIT: read + modify files (adds write/edit/patch-style tools, no shell).
   (n) => /^(read|grep|glob|ls|list|find|edit|write|patch|multiedit)$/.test(n) || /_?(edit|write|patch)$/.test(n),
+  // FULL: everything (shell, web, task, subagents, etc.).
   () => true,
 ];
 
@@ -192,6 +205,159 @@ function extractEdited(input: any): string | undefined {
     if (typeof value === "string" && value) return value;
   }
   return undefined;
+}
+
+// Returns true when a shell command looks dangerous per the System One guardrail.
+// Shared by the tool_call hook and reflex_run dispatch so the guard is enforced
+// no matter how a command reaches execution. Fails open (returns false = allowed)
+// when the classifier is unavailable, matching the plugin's never-block-when-down
+// convention.
+async function isDangerousCommand(command: string): Promise<boolean> {
+  const score = await arAsk(
+    `Command to be executed in terminal: ${command}`,
+    "Determine if this command may damage system files, remove directories without backup or leak environment keys.",
+  );
+  return score !== null && score > GUARD_THRESHOLD;
+}
+
+// Truncates a long tool output for the model-facing result and points at the rest.
+function truncateOutput(text: string, limit = 24_000): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n\n[agent-reflex] output truncated (${text.length} chars total). Re-run with a narrower scope to see more.`;
+}
+
+interface ToolCandidate {
+  name: string;
+  description: string;
+  input: any;
+}
+
+// Deterministic tool selection by SCHEMA FIT: only tools whose required args the
+// model's task/target can satisfy are returned. A tool whose required args cannot be
+// filled is never dispatched (that is what 400s).
+function fitTools(
+  candidates: ToolCandidate[],
+  task: string,
+  target: string,
+): Array<{ name: string; description: string; input: any; args: Record<string, any>; missing: string[]; fallback: boolean }> {
+  const fitting: Array<{ name: string; description: string; input: any; args: Record<string, any>; missing: string[]; fallback: boolean }> = [];
+  for (const c of candidates) {
+    const built = buildArgsFromSchema(c.input, task, target);
+    const fits = built.fallback ? true : built.missing.length === 0;
+    if (fits) fitting.push({ name: c.name, description: c.description, input: c.input, args: built.args, missing: built.missing, fallback: built.fallback });
+  }
+  return fitting;
+}
+
+// Renders a tool's real input schema as compact readable text for the decision model.
+function describeToolSchema(schema: any): string {
+  if (!schema || typeof schema !== "object") return "";
+  const props: Record<string, any> = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+  const required: string[] = Array.isArray(schema.required) ? schema.required : [];
+  const names = Object.keys(props);
+  if (names.length === 0) return "(args: see description)";
+  const parts = names.map((n) => {
+    const d = props[n] ?? {};
+    const type = typeof d.type === "string" ? d.type : "any";
+    const req = required.includes(n) ? "required" : "optional";
+    const desc = typeof d.description === "string" && d.description ? `: ${d.description}` : "";
+    return `${n} (${type}, ${req})${desc}`;
+  });
+  return `args: ${parts.join("; ")}`;
+}
+
+// Derives pseudo input-property hints from a tool's free-text description for
+// codec-style schemas that are not introspectable.
+function inferPropsFromDescription(description: string): Record<string, any> {
+  const d = String(description ?? "").toLowerCase();
+  const props: Record<string, any> = {};
+  if (/(?:command|shell|exec|run\b|terminal)/.test(d)) props.command = { type: "string", description: "shell command to execute" };
+  if (/(?:read|file|path|open|load|cat\b)/.test(d)) props.path = { type: "string", description: "file path to read" };
+  if (/(?:write|create|save|content|overwrite)/.test(d)) { props.path = props.path ?? { type: "string", description: "file path" }; props.content = { type: "string", description: "text content to write" }; }
+  if (/(?:edit|replace|update|patch|new string)/.test(d)) { props.path = props.path ?? { type: "string", description: "file path to edit" }; props.new_string = { type: "string", description: "replacement text" }; }
+  if (/(?:search|grep|find|pattern|query|match|glob)/.test(d)) props.pattern = { type: "string", description: "search pattern or query" };
+  if (/(?:fetch|web|url|http|download|page)/.test(d)) props.url = { type: "string", description: "url to fetch" };
+  return props;
+}
+
+// Builds args MECHANICALLY from the real input JSON schema (types + required + field
+// name/description tokens only; no tool-intent guessing). Required-but-unsourced
+// fields are reported missing. `fallback` signals a non-introspectable schema.
+function buildArgsFromSchema(schema: any, task: string, target: string): { args: Record<string, any>; missing: string[]; fallback: boolean } {
+  const args: Record<string, any> = {};
+  const missing: string[] = [];
+  const props: Record<string, any> = schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+  const required: string[] = Array.isArray(schema?.required) ? schema.required : Object.keys(props);
+  if (Object.keys(props).length === 0 && required.length === 0) return { args: {}, missing: [], fallback: true };
+
+  // Value source purely from the property's own name + description tokens. `payload`
+  // flags fields consuming task TEXT so multi-payload schemas are detected as
+  // ambiguous and none is filled (no guessing which the task text belongs to).
+  const classify = (name: string, def: any): "task" | "target" | "payload" | undefined => {
+    const hay = `${name} ${typeof def?.description === "string" ? def.description : ""}`.toLowerCase();
+    if (/(?:command|cmd|script|exec|shell|\brun\b)/.test(hay)) return "target";
+    if (/(?:path|file|filename|dir|directory|location)/.test(hay)) return "target";
+    if (/(?:pattern|query|search|regex|glob|match|filter)/.test(hay)) return "target";
+    if (/(?:url|href|uri|link|address)/.test(hay)) return "target";
+    if (/(?:\bcontent\b|new_?string|replacement|\bbody\b|\bpayload\b|\binstructions\b)/.test(hay)) return "task";
+    if (/(?:old_?string|_?string\b|\btext\b|\bsnippet\b|\bcode\b|\bvalue\b)/.test(hay)) return "payload";
+    return undefined;
+  };
+
+  const taskSourced: string[] = [];
+  for (const [name, def] of Object.entries(props)) {
+    const declaredType = (def as any)?.type;
+    const cls = classify(name, def);
+    if (cls === "target") {
+      if (target !== "") {
+        args[name] = declaredType === "number" || declaredType === "integer" ? Number(target) || 0 : declaredType === "boolean" ? Boolean(target) : String(target);
+        continue;
+      }
+      if (required.includes(name)) missing.push(name);
+      continue;
+    }
+    if (cls === "task" || cls === "payload") {
+      taskSourced.push(name);
+      continue;
+    }
+    if (required.includes(name)) missing.push(name);
+  }
+  if (taskSourced.length === 1 && task !== "") {
+    const name = taskSourced[0];
+    const declaredType = (props[name] as any)?.type;
+    args[name] = declaredType === "number" || declaredType === "integer" ? Number(task) || 0 : declaredType === "boolean" ? Boolean(task) : String(task);
+  } else {
+    for (const name of taskSourced) {
+      if (required.includes(name)) missing.push(name);
+    }
+  }
+  for (const name of required) {
+    if (!(name in args) && !missing.includes(name)) missing.push(name);
+  }
+  return { args, missing, fallback: false };
+}
+
+// Renders a nested tool result into plain text the model can read. Pi tool results
+// carry a content array of parts (text/etc.); this flattens it and falls back to
+// JSON for unexpected shapes. This is what feeds the sub-tool's real output back
+// through reflex_run to the model.
+function renderToolOutput(result: any): string {
+  if (result == null) return "(no output)";
+  if (typeof result === "string") return result;
+  const content = result?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part: any) => (typeof part === "string" ? part : part?.text ?? part?.content ?? ""))
+      .filter((s: string) => s)
+      .join("\n");
+    if (text) return text;
+  }
+  try {
+    return JSON.stringify(result);
+  } catch {
+    return String(result);
+  }
 }
 
 export default function (pi: any) {
@@ -325,15 +491,7 @@ export default function (pi: any) {
     if (!command.trim()) return undefined;
 
     arLog(`guard tool=${name} command=${command.slice(0, 200)}`);
-    const score = await arAsk(
-      `Command to be executed in terminal: ${command}`,
-      "Determine if this command may damage system files, remove directories without backup or leak environment keys.",
-    );
-    arLog(`guard score=${score ?? "null"}`);
-
-    if (score === null) return undefined; // classifier unavailable -> allow
-
-    if (score > GUARD_THRESHOLD) {
+    if (await isDangerousCommand(command)) {
       return {
         block: true,
         reason: "[GUARDRAIL BLOCKED]: Potentially dangerous command aborted.",
@@ -456,6 +614,161 @@ export default function (pi: any) {
         content: [{ type: "text", text: `Confidence ${pct.toFixed(1)}%. Verdict: CONTINUE.` }],
         details: {},
       };
+    },
+  });
+
+  // ---- reflex_run: decision-model tool dispatch (OPTIONAL FALLBACK) ----
+  // A fallback the model reaches for ONLY when it cannot decide which underlying
+  // tool to call for a task. It is not the default path — the model calls the real
+  // tools directly whenever it knows which one fits. When it is unsure, its
+  // execute() asks the System One decision model ("choice") which sub-tool handles
+  // the task, dispatches that tool via ctx.executeTool, and FEEDS THE SUB-TOOL'S
+  // REAL OUTPUT BACK into this tool's result so the model sees what actually
+  // happened. The decision model picks the tool; arguments come from the model's
+  // own reflex_run call. The shell guardrail runs before dispatch, so it is
+  // enforced however reflex_run is invoked. Nested calls do not add transcript
+  // entries (Pi reports them to the calling tool only), which is why the output is
+  // surfaced here.
+  pi.registerTool({
+    name: "reflex_run",
+    label: "Reflex run",
+    description:
+      "Fallback dispatcher for when you cannot decide which underlying tool to call for a task. Pass the intent and any target (a file path, a shell command, a search query); Reflex picks the right tool, runs it, and returns its real output. Prefer calling tools directly when you already know which one to use — reach for this only when the correct tool is unclear.",
+    parameters: {
+      type: "object",
+      properties: {
+        task: {
+          type: "string",
+          description: "What to do, as plain intent (e.g. 'read the config', 'run the test suite', 'find where parseFoo is defined').",
+        },
+        target: {
+          type: "string",
+          description: "The concrete target: a file path to read/edit, a shell command to run, or a search term. Optional.",
+        },
+      },
+      required: ["task"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId: string, params: any, _signal: any, onUpdate: any, ctx: any) {
+      const task = String(params?.task ?? "").trim();
+      const target = String(params?.target ?? "").trim();
+      if (!task && !target) {
+        return { content: [{ type: "text", text: "No task provided. Pass what to do in `task`, and a file path/command/query in `target`." }], details: {} };
+      }
+
+      // Pool-driven: read the REAL callable tool pool and dispatch from it — no
+      // hardcoded tool catalog or guessed arg shapes. Meta-tools (reflex_run itself
+      // and the Code Mode infrastructure) are not dispatch targets.
+      const META = new Set(["reflex_run", "execute", "search", "skill", "question", "subagent", "codemode", "tool_search"]);
+      const pool: Array<{ name: string; description: string; input: any }> = [];
+      try {
+        for (const t of pi.getAllTools?.() ?? []) {
+          const name = String(typeof t === "string" ? t : (t?.name ?? t?.toolName ?? ""));
+          if (!name || META.has(name)) continue;
+          const schema = (t as any)?.parameters ?? (t as any)?.input ?? (t as any)?.inputSchema;
+          pool.push({ name, description: String((t as any)?.description ?? name), input: schema });
+        }
+      } catch {
+        // getAllTools unavailable -> fall back to ctx.tools names below
+      }
+      // Restrict to tools the current context can execute when that list is present.
+      let callables: string[] | null = null;
+      try {
+        const c = (ctx?.tools ?? []).map((t: any) => (typeof t === "string" ? t : t?.name ?? t?.toolName ?? "")).filter(Boolean);
+        if (c.length > 0) callables = c;
+      } catch {
+        callables = null;
+      }
+      let candidates = pool;
+      if (callables) candidates = pool.filter((t) => callables!.includes(t.name));
+      if (candidates.length === 0) {
+        return { content: [{ type: "text", text: "[reflex_run] No dispatchable tools are registered in this session." }], details: {} };
+      }
+
+      // Deterministic selection by schema fit: only tools whose required args the
+      // model's task/target can satisfy are dispatched. Single fit -> no classifier.
+      // Several fit -> decision model tie-breaks among THEM with full schema context.
+      const fitting = fitTools(candidates, task, target);
+      if (fitting.length === 0) {
+        return { content: [{ type: "text", text: "[reflex_run] No registered tool's required arguments can be satisfied by the given task/target. Call a tool directly with explicit arguments." }], details: {} };
+      }
+
+      let chosen: ToolCandidate & { args: Record<string, any>; missing: string[]; fallback: boolean };
+      if (fitting.length === 1) {
+        chosen = fitting[0];
+      } else {
+        const criteria: Record<string, string> = {};
+        for (const t of fitting) {
+          const schemaText = describeToolSchema(t.input);
+          criteria[t.name] = schemaText ? `${t.description} | ${schemaText}` : t.description;
+        }
+        const state = `User task: ${task}${target ? `\nTarget: ${target}` : ""}`;
+        const picked = await arAskChoice(
+          state,
+          "These tools can all take the given arguments. Which one best matches the task? Consider each tool's description and input schema.",
+          criteria,
+        );
+        chosen = fitting.find((t) => t.name === picked?.choice) ?? fitting[0];
+      }
+
+      const chosenName = chosen.name;
+      const chosenTool = candidates.find((t) => t.name === chosenName)!;
+      let args = chosen.args;
+      let missing = chosen.missing;
+      const conf = fitting.length === 1 ? "schema-fit" : "tie-broken";
+      arLog(`reflex_run task="${task.slice(0, 120)}" -> ${chosenName} (${conf})`);
+
+      if (chosen.fallback) {
+        const inferred = buildArgsFromSchema({ properties: inferPropsFromDescription(chosenTool.description), required: [] }, task, target);
+        args = inferred.args;
+        if (Object.keys(args).length === 0) {
+          const desc = String(chosenTool.description ?? "").toLowerCase();
+          if (/(?:command|shell|exec|run\b)/.test(desc)) args = { command: target || task };
+          else if (/(?:read|file|path|open)/.test(desc)) args = { path: target, filePath: target };
+          else if (/(?:search|grep|find|pattern|query)/.test(desc)) args = { pattern: target || task, query: target || task };
+          else if (/(?:fetch|web|url|http)/.test(desc)) args = { url: target };
+          else if (/(?:write|content|create)/.test(desc)) args = { path: target, content: task };
+          else return { content: [{ type: "text", text: `[reflex_run] Cannot infer the arguments for \`${chosenName}\` from its schema/description. Call it directly with explicit arguments.` }], details: {} };
+        }
+        missing = [];
+      }
+      if (missing.length > 0) {
+        return {
+          content: [{ type: "text", text: `[reflex_run] \`${chosenName}\` needs argument(s) the task/target did not supply: ${missing.join(", ")}. Re-invoke reflex_run with more detail, or call \`${chosenName}\` directly with explicit arguments.` }],
+          details: { missingArgs: missing },
+        };
+      }
+
+      // Guardrail before dispatching a shell-like tool (its schema takes a command).
+      const command = typeof args.command === "string" ? args.command : typeof args.cmd === "string" ? args.cmd : "";
+      const isShell = Boolean(command) || /command|cmd|script|exec/i.test(Object.keys(args).join(" "));
+      if (isShell && command && (await isDangerousCommand(command))) {
+        return {
+          content: [{ type: "text", text: "[GUARDRAIL BLOCKED]: Potentially dangerous command aborted. Not running it." }],
+          details: { guarded: true, command },
+        };
+      }
+
+      // Dispatch and feed the sub-tool's REAL output back to the model.
+      try {
+        const result = await ctx.executeTool(chosenName, args, {
+          signal: _signal,
+          onUpdate: typeof onUpdate === "function" ? onUpdate : undefined,
+        });
+        const output = truncateOutput(renderToolOutput(result));
+        return {
+          content: [
+            { type: "text", text: `[reflex_run] Delegated to \`${chosenName}\` (${conf} confident).\n\n${output}` },
+          ],
+          details: { delegatedTo: chosenName, selection: conf, args },
+          usage: result?.usage,
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `[reflex_run] Failed to run \`${chosenName}\`: ${error?.message ?? error}` }],
+          details: { delegatedTo: chosenName, error: String(error?.message ?? error) },
+        };
+      }
     },
   });
 

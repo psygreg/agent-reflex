@@ -56,12 +56,21 @@ git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
   model's current line of thought and returns CONTINUE or RESTART.
 - **Tool exposure**: for each prompt the classifier decides which tools the
   task needs and the model is given only those, so the request carries fewer
-  tool schemas and saves input tokens. A core set (read, grep, glob, edit,
-  write, bash, shell, task…) and any tool already used this session are always
-  kept, and everything is exposed if the classifier is unavailable. Only works
-  where the agent can drop tools from the model request (OpenCode and Pi);
+  tool schemas and saves input tokens. The always-keep set is the common core
+  (read/search/edit/shell/task) plus `reflex_run`, so the model keeps its direct
+  tools and only the long tail (web, exec, subagents…) is trimmed to what the
+  task clearly needs or the model already used this session. Everything is
+  exposed if the classifier is unavailable. Only
+  works where the agent can drop tools from the model request (OpenCode and Pi);
   the shell-hook agents can only deny a call after the model already chose the
   tool, which saves no tokens, so they do not get it.
+- **Tool dispatch** (`reflex_run`): an optional fallback tool for when the model
+  cannot decide which underlying tool a task needs. It asks the decision model
+  which tool to use (a `choice` decision), runs it, and returns its real output.
+  The model calls tools directly whenever it already knows which one fits and
+  reaches for `reflex_run` only when the correct tool is unclear. The shell
+  guardrail runs before dispatch. On OpenCode and Pi. Tool dispatch uses the
+  same configured classifier model as the rest of the plugin.
 - **Shell guardrail**: shell commands are scored for damage potential;
   dangerous ones are denied.
 - **Syntax checks**: after `edit`/`write` the file is checked with language
@@ -86,16 +95,16 @@ names), so the user answers the classifier questions once.
 The two features that require rewriting the model request — dynamic effort and
 custom history pruning — only reach agents whose hook API can do that:
 
-| Agent | Guardrail | Post-edit checks | Compaction guidance | Dynamic effort | History pruning | Tool exposure | Key caveat |
-|---|---|---|---|---|---|---|---|
-| OpenCode | hard block | inline | built-in | full (per-model dialects) | pruning | yes | Reference implementation; everything works. |
-| Pi | hard block | inline | via `context` | full (`setThinkingLevel`) | opt-in | yes (`setActiveTools`) | Pi translates the effort level per model itself. |
-| MiMo Code | hard block | inline | compacting hook | token cap only | opt-in | no | `chat.params` has `maxTokens` but no `reasoning_effort`. |
-| Claude Code | hard block | inline | `custom_instructions` | no | no | no | Hooks cannot rewrite the request or the message list. |
-| Qwen Code | hard block | inline | `custom_instructions` | no | no | no | Same hook limits as Claude Code. |
-| Codex | hard block | inline | inert | no | no | no | Compaction hook can only cancel compaction; edits via `apply_patch` (V4A). |
-| Antigravity | hard block | one turn late | inert | no | no | no | `PostToolUse` cannot inject context (antigravity-cli#808). |
-| Hermes | wrapper tool | inline | none | no | no | no | Hooks cannot block a tool call; guardrail is a `safe_run` wrapper. |
+| Agent | Guardrail | Post-edit checks | Compaction guidance | Dynamic effort | History pruning | Tool exposure | Tool dispatch | Key caveat |
+|---|---|---|---|---|---|---|---|---|
+| OpenCode | hard block | inline | built-in | full (per-model dialects) | pruning | yes | yes (`reflex_run`) | Reference implementation; everything works. |
+| Pi | hard block | inline | via `context` | full (`setThinkingLevel`) | opt-in | yes (`setActiveTools`) | yes (`reflex_run`) | Pi translates the effort level per model itself. |
+| MiMo Code | hard block | inline | compacting hook | token cap only | opt-in | no | no | `chat.params` has `maxTokens` but no `reasoning_effort`. |
+| Claude Code | hard block | inline | `custom_instructions` | no | no | no | no | Hooks cannot rewrite the request or the message list. |
+| Qwen Code | hard block | inline | `custom_instructions` | no | no | no | no | Same hook limits as Claude Code. |
+| Codex | hard block | inline | inert | no | no | no | no | Compaction hook can only cancel compaction; edits via `apply_patch` (V4A). |
+| Antigravity | hard block | one turn late | inert | no | no | no | no | `PostToolUse` cannot inject context (antigravity-cli#808). |
+| Hermes | wrapper tool | inline | none | no | no | no | no | Hooks cannot block a tool call; guardrail is a `safe_run` wrapper. |
 
 When installing or updating, tell the user which caveats apply to their agent and
 point them at the port's own README (`plugins/<agent>/README.md`) for details.

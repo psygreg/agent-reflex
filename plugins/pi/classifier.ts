@@ -217,3 +217,79 @@ export async function arAskMany(state: string, questionsById: Record<string, str
   }
   return primary;
 }
+
+// A "choice" decision: pick one option from named criteria. Returns the chosen
+// key plus per-option probabilities and an overall confidence, or null when the
+// classifier is unavailable. This is the primitive Reflex uses to select which
+// sub-tool to dispatch (the decision model picks the tool in one forward pass).
+export interface ChoiceAnswer {
+  choice: string | null;
+  probabilities: Record<string, number>;
+  confidence: number | null;
+}
+
+async function askChoice(
+  state: string,
+  question: string,
+  criteria: Record<string, string>,
+  model: string,
+): Promise<ChoiceAnswer | null> {
+  const base = baseUrl();
+  if (!base || !model || Object.keys(criteria).length === 0) return null;
+  const key = resolveEnv(config("apiKey")) || undefined;
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (key) headers["Authorization"] = `Bearer ${key}`;
+
+  const body = JSON.stringify({
+    model,
+    state,
+    questions: { q: { type: "choice", instructions: question, criteria } },
+  });
+
+  let data: any;
+  try {
+    const resp = await fetch(`${base}/systemone`, {
+      method: "POST",
+      headers,
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    data = await resp.json();
+  } catch {
+    return null;
+  }
+
+  const answer = data?.answers?.q;
+  if (!answer || answer.type !== "choice") return null;
+  const probabilities: Record<string, number> = {};
+  if (answer.probabilities && typeof answer.probabilities === "object") {
+    for (const [k, v] of Object.entries(answer.probabilities)) {
+      const n = Number(v);
+      if (Number.isFinite(n)) probabilities[k] = n;
+    }
+  }
+  return {
+    choice: typeof answer.choice === "string" ? answer.choice : null,
+    probabilities,
+    confidence: Number.isFinite(Number(answer.confidence)) ? Number(answer.confidence) : null,
+  };
+}
+
+// Asks a "choice" question, falling back to fallbackModel when the primary gives
+// no usable answer. Uses the configured model (like every other classifier call).
+// Fails open to null when the classifier is unavailable.
+export async function arAskChoice(state: string, question: string, criteria: Record<string, string>): Promise<ChoiceAnswer | null> {
+  const model = config("model");
+  if (!model) return null;
+
+  const primary = await askChoice(state, question, criteria, model);
+  if (primary && primary.choice) return primary;
+
+  const fallback = config("fallbackModel");
+  if (fallback && fallback !== model) {
+    return askChoice(state, question, criteria, fallback);
+  }
+  return primary;
+}
