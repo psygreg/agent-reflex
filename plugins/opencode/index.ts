@@ -605,6 +605,109 @@ function applyGrokLevel(body: any, level: EffortLevel, url: string): boolean {
   return false;
 }
 
+// MiniMax request fields per complexity level (MiniMax-M3 family onwards).
+// MiniMax exposes two separate knobs (MiniMax's OpenAI SDK / Chat Completions docs):
+// - thinking: {type} is the on/off switch. Its type is only "disabled" or
+//   "adaptive" — NOT "enabled" (unlike Xiaomi MiMo / Kimi / Qwen, which use
+//   "enabled"). Omitting thinking leaves thinking on (adaptive). "disabled" is
+//   honored on MiniMax-M3 alone; MiniMax-M3.1-Flash-Preview returns HTTP 400
+//   (it always thinks) and the M2.x models accept-but-ignore it.
+// - reasoning_effort tunes thinking depth: low | medium | high | xhigh | max
+//   (default "max"). It is honored on MiniMax-M3.1-Flash-Preview only; M3 and
+//   M2.x ignore it. "none" is NOT accepted anywhere and returns HTTP 400.
+// M2.x and older think at a fixed depth and can neither be disabled nor tuned,
+// so they are left untouched rather than risk a foreign or 400ing field.
+const MINIMAX_LEVEL_REQUEST = {
+  simple: { thinking: false, effort: "low" },
+  medium: { thinking: true, effort: "medium" },
+  high: { thinking: true, effort: "max" },
+} as const;
+
+// MiniMax capabilities parsed from the model id in a request body.
+// canDisable: thinking can be switched off (thinking.type "disabled") — MiniMax-M3
+// only. Models that cannot disable thinking fall back to the lowest effort on the
+// simple level. tunable: reasoning_effort tunes thinking depth — MiniMax-M3.1-
+// Flash-Preview only. Models that do not tune get the on/off switch alone.
+interface MiniMaxModel {
+  canDisable: boolean;
+  tunable: boolean;
+}
+
+// Matches "MiniMax-M3", "minimax-m3.1-flash-preview", "minimax/minimax-m3",
+// "minimax-m3.1"... Gate at MiniMax-M3 onwards: the M2.x generation (M2, M2.1,
+// M2.5, M2.7 and their -highspeed pairs) can neither disable thinking nor tune
+// its depth, and the M1 / abab lines predate thinking controls entirely. Both
+// flags come from the version: M3 (3.0) can disable but not tune depth; M3.1+
+// (the Flash preview) always thinks but tunes depth via reasoning_effort.
+function parseMiniMaxModel(model: unknown): MiniMaxModel | null {
+  if (typeof model !== "string") return null;
+  const id = model.toLowerCase().split("/").pop() ?? "";
+  const match = id.match(/^minimax[-_.\s]?m?(\d+)(?:[._-](\d+))?/);
+  if (!match) return null;
+  const major = parseInt(match[1], 10);
+  const minor = match[2] ? parseInt(match[2], 10) : 0;
+  if (major < 3) return null;
+  return {
+    // thinking.type "disabled" is accepted by MiniMax-M3 only (M3.1-Flash 400s).
+    canDisable: minor === 0,
+    // reasoning_effort tunes depth on M3.1-Flash-Preview only (M3 ignores it).
+    tunable: minor > 0,
+  };
+}
+
+// Applies the session's level to a MiniMax request body (in place). Returns false
+// when the request must stay untouched (not a MiniMax-M3+ model, or an endpoint
+// shape MiniMax does not serve). The field dialect per surface:
+// - /messages (MiniMax's Anthropic-compatible surface, the one OpenCode Go and
+//   other agents use): thinking.type as the on/off switch where the model accepts
+//   it (MiniMax-M3), plus output_config.effort where the model tunes depth
+//   (M3.1-Flash). Note the M3 default here is OFF when thinking is omitted, so
+//   the switch is written on every level (adaptive enables it).
+// - /chat/completions (MiniMax's OpenAI-compatible surface): thinking.type where
+//   the model accepts it (MiniMax-M3, default ON), plus reasoning_effort where the
+//   model tunes depth (M3.1-Flash). OpenRouter speaks its unified reasoning.effort
+//   instead of either field.
+// - /responses (MiniMax's OpenAI Responses surface): reasoning.effort, whose
+//   "none" is rejected exactly like reasoning_effort, so the simple level sends
+//   the lowest effort there.
+// Simple turns thinking off where the model allows it (MiniMax-M3), else drops to
+// the lowest effort. presence_penalty, frequency_penalty and logit_bias are
+// ignored by MiniMax, but those are the caller's fields and are left alone here.
+function applyMiniMaxLevel(body: any, level: EffortLevel, url: string): boolean {
+  const minimax = parseMiniMaxModel(body?.model);
+  if (!minimax) return false;
+
+  const request = MINIMAX_LEVEL_REQUEST[level];
+  const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  const off = level === "simple" && minimax.canDisable;
+
+  if (isAnthropicMessagesEndpoint(url)) {
+    // MiniMax's /messages: thinking.type toggle (M3 only, default off here) and
+    // output_config.effort for depth (M3.1-Flash only). "none" is not accepted.
+    if (minimax.canDisable) body.thinking = { type: off ? "disabled" : "adaptive" };
+    if (minimax.tunable) body.output_config = { ...(body.output_config ?? {}), effort: request.effort };
+    return true;
+  }
+
+  if (/\/responses$/i.test(pathname)) {
+    // reasoning.effort has no "none"; the lowest effort stands in for off.
+    body.reasoning = { ...(body.reasoning && typeof body.reasoning === "object" ? body.reasoning : {}), effort: request.effort };
+    return true;
+  }
+
+  if (/\/chat\/completions$/i.test(pathname)) {
+    if (isOpenRouterUrl(url)) {
+      body.reasoning = { effort: request.effort };
+      return true;
+    }
+    if (minimax.canDisable) body.thinking = { type: off ? "disabled" : "adaptive" };
+    if (minimax.tunable) body.reasoning_effort = request.effort;
+    return true;
+  }
+
+  return false;
+}
+
 // Effort dialect detection is per request, from the model actually being requested.
 // The http.request hook event carries the provider's own model reference
 // (event.model), even when a gateway like OpenCode Go proxies many models
@@ -720,6 +823,9 @@ function detectBackend(model: { providerID?: string; id?: string } | undefined, 
   // served Kimi keeps the local server's own controls.
   if (parseKimiModel(modelId) && !isLocalHost(url)) return "kimi";
   if (parseGrokModel(modelId) && !isLocalHost(url)) return "grok";
+  // MiniMax models from M3 onwards through a remote API. A locally served MiniMax
+  // keeps the local server's own controls.
+  if (parseMiniMaxModel(modelId) && !isLocalHost(url)) return "minimax";
   // Local inference servers (llama.cpp, Ollama) on loopback or LAN hosts.
   if (isLocalHost(url)) return "local";
   return null;
@@ -733,7 +839,7 @@ const CONFIDENCE_TOOL = "systemone_check_confidence";
 // Effort dialect a primary request may speak, decided per request from the model
 // being requested. "local": a local inference server (llama.cpp or Ollama) on a
 // loopback or LAN host.
-type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "qwen" | "kimi" | "grok" | "local";
+type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "qwen" | "kimi" | "grok" | "minimax" | "local";
 
 interface SystemOneConfig {
   baseURL: string;
@@ -1063,6 +1169,8 @@ export default Plugin.define({
           if (!applyKimiLevel(body, level, event.request.url)) return;
         } else if (dialect === "grok") {
           if (!applyGrokLevel(body, level, event.request.url)) return;
+        } else if (dialect === "minimax") {
+          if (!applyMiniMaxLevel(body, level, event.request.url)) return;
         } else {
           // Local inference server, its kind probed once per origin.
           // Ollama and llama.cpp both take top-level reasoning_effort on

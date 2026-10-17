@@ -45,7 +45,10 @@ git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
   the Anthropic surface), Moonshot Kimi 2.7+/K3 (`reasoning_effort` on K3,
   `thinking.type` toggle on K2.7/K2.6), xAI Grok 4.3+ (`reasoning_effort`, or
   `reasoning.effort` on Responses; `none` disables on grok-4.3 only, `xhigh`
-  tops out on grok-4.3/4.6+), local llama.cpp/Ollama
+  tops out on grok-4.3/4.6+), MiniMax M3+ (`thinking.type` on/off — `adaptive`
+  / `disabled`, never `enabled` — on MiniMax-M3; `reasoning_effort` tunes depth
+  on M3.1-Flash, and `reasoning.effort` on Responses; `none` is rejected, so
+  simple maps to the lowest effort), local llama.cpp/Ollama
   (`reasoning_effort`, plus `chat_template_kwargs` on llama.cpp). Dialects are
   detected per request, so multimodel setups never send a foreign field;
   models without a wired dialect stay untouched.

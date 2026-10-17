@@ -17,7 +17,7 @@ your classifier settings.
   (`off`/`low`/`high`) with `pi.setThinkingLevel()`. Pi translates the unified
   level to each model's native wire field via its own `thinkingLevelMap`, so this
   replaces the OpenCode plugin's hand-rolled per-vendor dialects (GLM, MiMo,
-  Gemini, Qwen, Kimi, Grok…). This is the plugin's headline feature and it works
+  Gemini, Qwen, Kimi, Grok, MiniMax…). This is the plugin's headline feature and it works
   at full fidelity here.
 - **Custom history pruning** (`context`, opt-in): when the history grows long,
   scores each old message with the classifier and drops the redundant ones,
