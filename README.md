@@ -14,7 +14,7 @@ the TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen. Every
 feature below is driven by this classifier.
 
 ### Features
-- **Decision-driven history compaction**
+- **Decision-driven history compaction**: keeps the recent messages verbatim (keep-window widens with complexity), keeps a bounded set of load-bearing older messages, and folds the rest into a compact structured digest so their detail is compressed rather than discarded
 - **Dynamic thinking effort level**: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` and switching the reasoning effort accordingly. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin. Wired dialects: Anthropic, llama.cpp, Ollama, OpenAI GPT reasoning models, Z.ai GLM (GLM-5.2 onwards), Xiaomi MiMo (MiMo-V2.5 onwards), Google Gemini (Gemini 3 onwards), Qwen (Qwen3.5 onwards and the qwen-plus/qwen-max aliases), Moonshot Kimi (kimi-k2.7+/kimi-k3), xAI Grok (grok-4.3 onwards) and MiniMax (MiniMax-M3 onwards)
 - **Confidence level tool**: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check the confidence of its current line of thinking before finalizing a response and correct itself along the way if needed
 - **Tool exposure**: for each prompt the classifier decides which tools the task actually needs and the model is given only those, so the request carries fewer tool schemas and saves input tokens. The always-keep set is the common core (read/search/edit/shell/task) plus `reflex_run`, so the model keeps the direct tools it reaches for constantly and only the long tail (web, exec, subagents…) is trimmed to what the task clearly needs or the model already used this session. Falls back to exposing everything if the classifier is unavailable
@@ -26,16 +26,17 @@ feature below is driven by this classifier.
 
 Eight agents are supported. The classifier config is shared across all of them
 (`agent-reflex.jsonc`, same option names), so the classifier questions are answered
-once. The two features that require the plugin to rewrite the model request — dynamic
-effort and custom history pruning — only reach agents whose hook API can do that.
+once. Dynamic effort needs the plugin to rewrite the model request, and history
+compaction needs it to rewrite the message list — both only reach agents whose hook
+API allows that rewrite.
 
-| Agent | Shell guardrail | Post-edit checks | Classify + confidence | Compaction guidance | Dynamic effort | History pruning | Tool exposure | Tool dispatch | Notes |
+| Agent | Shell guardrail | Post-edit checks | Classify + confidence | Compaction guidance | Dynamic effort | History compaction | Tool exposure | Tool dispatch | Notes |
 |---|---|---|---|---|---|---|---|---|---|
-| **OpenCode** | ✅ hard block | ✅ inline | ✅ | ✅ built-in | ✅ full (per-model dialects) | ✅ pruning | ✅ | ✅ (`reflex_run`) | Reference implementation and the only agent where everything works. |
-| **Pi** | ✅ hard block | ✅ inline | ✅ | ✅ via `context` | ✅ full (`setThinkingLevel`) | ✅ opt-in pruning | ✅ (`setActiveTools`) | ✅ (`reflex_run`) | Pi translates the unified effort level per model itself, so no per-vendor dialect code is needed. |
-| **MiMo Code** | ✅ hard block | ✅ inline | ✅ | ✅ compacting hook | ⚠️ token cap only | ✅ opt-in pruning | ❌ | ❌ | OpenCode-derived. `chat.params` sets `maxTokens` but not `reasoning_effort`, so effort cannot change how hard the model thinks. |
-| **Claude Code** | ✅ hard block | ✅ inline | ✅ | ✅ `custom_instructions` | ❌ | ❌ | ❌ | ❌ | Hooks cannot rewrite the model request or return a pruned message list. |
-| **Qwen Code** | ✅ hard block | ✅ inline | ✅ | ✅ `custom_instructions` | ❌ | ❌ | ❌ | ❌ | Same hook limits as Claude Code. Strongest of the shell-hook ports. |
+| **OpenCode** | ✅ hard block | ✅ inline | ✅ | ✅ built-in | ✅ full (per-model dialects) | ✅ decision-driven | ✅ | ✅ (`reflex_run`) | Reference implementation and the only agent where everything works. |
+| **Pi** | ✅ hard block | ✅ inline | ✅ | ✅ via `context` | ✅ full (`setThinkingLevel`) | ✅ opt-in decision-driven | ✅ (`setActiveTools`) | ✅ (`reflex_run`) | Pi translates the unified effort level per model itself, so no per-vendor dialect code is needed. |
+| **MiMo Code** | ✅ hard block | ✅ inline | ✅ | ✅ compacting hook | ⚠️ token cap only | ✅ opt-in decision-driven | ❌ | ❌ | OpenCode-derived. `chat.params` sets `maxTokens` but not `reasoning_effort`, so effort cannot change how hard the model thinks. |
+| **Claude Code** | ✅ hard block | ✅ inline | ✅ | ✅ fact-extraction guidance | ❌ | ⚠️ digest guidance only | ❌ | ❌ | `PreCompact` reads the transcript and extracts the fact buckets to steer the summary, but hooks cannot rewrite the message list, so it cannot choose what to keep. |
+| **Qwen Code** | ✅ hard block | ✅ inline | ✅ | ✅ fact-extraction guidance | ❌ | ⚠️ digest guidance only | ❌ | ❌ | Same hook limits as Claude Code. Strongest of the shell-hook ports. |
 | **Codex** | ✅ hard block | ✅ inline | ✅ | ❌ inert | ❌ | ❌ | ❌ | ❌ | No `PreCompact` `custom_instructions`; its compaction hook can only cancel compaction. Edits arrive via `apply_patch` (V4A). |
 | **Antigravity** | ✅ hard block | ⚠️ one turn late | ✅ | ❌ inert | ❌ | ❌ | ❌ | ❌ | `PostToolUse` cannot inject context (open upstream antigravity-cli#808), so findings queue and surface at the next model call. |
 | **Hermes** | ⚠️ wrapper tool | ✅ inline | ✅ | ❌ none | ❌ | ❌ | ❌ | ❌ | Hooks cannot block a tool call, so the guardrail is a `safe_run` wrapper over `terminal`. No compaction hook. |

@@ -293,3 +293,80 @@ export async function arAskChoice(state: string, question: string, criteria: Rec
   }
   return primary;
 }
+
+// Batched "choice" decisions: one request carrying a question per id, each with
+// its own criteria, answered in a single round-trip. Used by history compaction to
+// extract every digest bucket at once. Ids the backend did not answer are omitted,
+// so a caller can tell a backend that only honors a single question and degrade
+// gracefully. Falls back to fallbackModel when the primary returns nothing usable.
+// Fails open to {} when the classifier is unavailable.
+export async function arAskChoiceMany(
+  state: string,
+  questionsById: Record<string, { instructions: string; criteria: Record<string, string> }>,
+): Promise<Record<string, ChoiceAnswer>> {
+  const model = config("model");
+  if (!model) return {};
+
+  const primary = await askChoiceMany(state, questionsById, model);
+  if (Object.keys(primary).length > 0) return primary;
+
+  const fallback = config("fallbackModel");
+  if (fallback && fallback !== model) {
+    return (await askChoiceMany(state, questionsById, fallback)) ?? {};
+  }
+  return primary;
+}
+
+async function askChoiceMany(
+  state: string,
+  questionsById: Record<string, { instructions: string; criteria: Record<string, string> }>,
+  model: string,
+): Promise<Record<string, ChoiceAnswer>> {
+  const ids = Object.keys(questionsById);
+  const out: Record<string, ChoiceAnswer> = {};
+  if (ids.length === 0) return out;
+
+  const base = baseUrl();
+  if (!base || !model) return out;
+  const key = resolveEnv(config("apiKey")) || undefined;
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (key) headers["Authorization"] = `Bearer ${key}`;
+
+  const questions: Record<string, any> = {};
+  for (const id of ids) {
+    questions[id] = { type: "choice", instructions: questionsById[id].instructions, criteria: questionsById[id].criteria };
+  }
+
+  let data: any;
+  try {
+    const resp = await fetch(`${base}/systemone`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model, state, questions }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!resp.ok) return out;
+    data = await resp.json();
+  } catch {
+    return out;
+  }
+
+  for (const id of ids) {
+    const answer = data?.answers?.[id];
+    if (!answer || answer.type !== "choice") continue;
+    const probabilities: Record<string, number> = {};
+    if (answer.probabilities && typeof answer.probabilities === "object") {
+      for (const [k, v] of Object.entries(answer.probabilities)) {
+        const n = Number(v);
+        if (Number.isFinite(n)) probabilities[k] = n;
+      }
+    }
+    out[id] = {
+      choice: typeof answer.choice === "string" ? answer.choice : null,
+      probabilities,
+      confidence: Number.isFinite(Number(answer.confidence)) ? Number(answer.confidence) : null,
+    };
+  }
+  return out;
+}

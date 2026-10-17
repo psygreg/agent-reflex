@@ -23,10 +23,14 @@ root with your classifier settings.
 - **Complexity classification** (`UserPromptSubmit`): scores each prompt
   *simple*/*medium*/*high* and, on medium/high, injects a note suggesting a
   confidence check.
-- **Compaction guidance** (`PreCompact`): steers Qwen Code's own compaction via
-  `custom_instructions` so the summary keeps the requirements, scope, and rules a
-  coding agent must not lose. Qwen Code supports the same `PreCompact
-  `custom_instructions` lever as Claude Code.
+- **Compaction guidance with fact extraction** (`PreCompact`): reads the
+  conversation transcript (`transcript_path`), extracts the facts it established
+  (goal, architecture, decisions, files, verification, and the other digest
+  buckets) with the classifier, and steers Qwen Code's own summarizer via
+  `custom_instructions` to preserve them. Falls back to enriched static guidance
+  when the transcript is unavailable. Qwen Code supports the same `PreCompact`
+  `custom_instructions` lever as Claude Code. Guidance only — it cannot choose what
+  to keep, just what the summary preserves.
 - **Confidence check** (`confidence` skill, invocable as `/agent-reflex:confidence`):
   scores the model's current line of thought and returns CONTINUE or RESTART.
 
@@ -59,9 +63,11 @@ model request itself. Qwen Code exposes neither, so two features stay OpenCode-o
 - **Per-request dynamic effort and `maxTokens`.** No Qwen Code hook can rewrite
   the request or set a per-request token cap. The classifier still classifies
   complexity, but only to drive the confidence suggestion and post-edit check depth.
-- **Custom history pruning.** Hooks can inject context but cannot return a pruned
-  message list. Qwen Code owns compaction (`/compress`, `PreCompact`); the plugin
-  can only steer what the summary keeps, not drop individual messages.
+- **Decision-driven history compaction.** Hooks can inject context but cannot
+  return a rewritten message list, so this plugin cannot select what to keep. Qwen
+  Code owns compaction (`/compress`, `PreCompact`); the plugin approximates the
+  digest step instead — `PreCompact` reads the transcript, extracts the same fact
+  buckets, and biases the summary to preserve them.
 
 If you need those features, use the OpenCode plugin (`plugins/opencode`).
 

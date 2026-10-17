@@ -2,12 +2,12 @@
 
 MiMo Code port of the `agent-reflex` OpenCode plugin: a small System One decision
 model runs alongside the agent to safeguard shell commands, double-check edits, cap
-tokens per task, prune history, and let the model sanity-check its own reasoning.
+tokens per task, compact history, and let the model sanity-check its own reasoning.
 
 MiMo Code is Xiaomi's own agent, and it is **OpenCode-derived** — `@mimo-ai/plugin`
 is nearly identical to `@opencode-ai/plugin`. So this port is the lowest-effort of the
 set, and it is the **second** (after Pi) where the two features every shell-based port
-lacks actually work: custom history pruning and per-request `maxTokens`. Install the
+lacks actually work: custom history compaction and per-request `maxTokens`. Install the
 hook files into your MiMo Code hooks dir and create `agent-reflex.jsonc` alongside
 them with your classifier settings.
 
@@ -24,9 +24,12 @@ them with your classifier settings.
   medium/high adds a note suggesting a confidence check to the system prompt.
 - **Per-request `maxTokens`** (`chat.params`): sets the generated-token cap per level
   (simple 8192 / medium 65536 / high 131072), matching the plugin's caps.
-- **Custom history pruning** (`experimental.chat.messages.transform`, opt-in): when
-  the history grows long, scores each old message and drops the redundant ones,
-  preserving structural (tool call/result) messages and the recent tail.
+- **Decision-driven history compaction** (`experimental.chat.messages.transform`,
+  opt-in): when the history grows long, keeps the recent tail verbatim (window sized
+  by complexity level), keeps a bounded set of high-relevance older messages verbatim,
+  and folds the rest into a structured digest — buckets (goal, architecture,
+  constraints, decisions, files, …) whose most representative sentence is picked by
+  the classifier's `choice` primitive. Compresses rather than discards.
 - **Compaction guidance** (`experimental.session.compacting`): steers the compaction
   summary to keep architectural requirements, scope, and rules.
 - **Confidence check** (`confidence_check` custom tool): scores the model's current
@@ -67,7 +70,7 @@ classifier is unavailable.
 
 | Flag | Effect |
 |---|---|
-| `AGENT_REFLEX_PRUNE=1` | Enable history pruning (`experimental.chat.messages.transform`). One classifier call per old message before every model request — real latency/token cost. Off by default. |
+| `AGENT_REFLEX_PRUNE=1` | Enable decision-driven history compaction (`experimental.chat.messages.transform`). One classifier call per old message plus one batched digest call per model request — real latency/token cost. Off by default. |
 
 The guardrail, post-edit check, classification, `maxTokens` cap, and compaction
 guidance are always on.

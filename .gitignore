@@ -1,0 +1,35 @@
+# Python bytecode / build artifacts (Hermes plugin, install-time python snippets)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node / Bun (install.sh JS merge, skills CLI)
+node_modules/
+bun.lock
+bun.lockb
+package-lock.json
+npm-debug.log*
+*.tsbuildinfo
+
+# Build / bundle output
+dist/
+build/
+out/
+*.js.map
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local test / temp scratch (test harnesses write here)
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# Classifier debug logs (debugLog option writes here)
+agent-reflex.log
+*.log

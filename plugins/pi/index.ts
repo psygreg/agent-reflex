@@ -17,7 +17,7 @@
 //   - tool_result: post-edit syntax + bug check, findings appended to the result.
 //   - confidence_check tool + /confidence command: on-demand confidence scoring.
 
-import { arAsk, arAskMany, arAskChoice, classifyLevel, config, arLog } from "./classifier";
+import { arAsk, arAskMany, arAskChoice, arAskChoiceMany, classifyLevel, config, arLog } from "./classifier";
 import { findSyntaxErrors, excerptAroundEdit, readFileText, CONTEXT_LINES } from "./check";
 
 // Complexity -> Pi thinking level. simple disables thinking where the model
@@ -44,15 +44,61 @@ const state = {
   usedTools: new Set<string>(),
 };
 
-// History pruning (OpenCode's HOOK 1a) is opt-in: it makes one classifier call per
-// old message before every model request, which is real latency/cost. Enable with
-// AGENT_REFLEX_PRUNE=1. Rules match the OpenCode plugin: only prune when the
-// history is long (>16), keep the last 4 verbatim, never drop structural messages
-// (tool calls/results), and drop a message only when its relevance score is <= 0.40.
-const PRUNE_ENABLED = process.env.AGENT_REFLEX_PRUNE === "1";
-const PRUNE_MIN_MESSAGES = 16;
-const PRUNE_KEEP_RECENT = 4;
-const PRUNE_KEEP_THRESHOLD = 0.4;
+// History compaction (OpenCode's HOOK 1a) is decision-driven: it keeps the most
+// recent messages verbatim (the keep window, sized by complexity level so a task
+// in flight never loses its working context), keeps a bounded set of high-relevance
+// older messages verbatim, and folds the remaining older messages into one
+// structured digest instead of discarding their detail. The digest is produced by
+// the classifier through "choice" decisions, so nothing depends on free-text
+// generation.
+//
+// Opt-in because compaction makes one classifier call per old message plus a
+// batched digest call before every model request — real latency/cost. Enable with
+// AGENT_REFLEX_PRUNE=1.
+const COMPACT_ENABLED = process.env.AGENT_REFLEX_PRUNE === "1";
+
+// Keep-window (most recent messages always kept verbatim) per complexity level.
+// High-complexity work has the most moving parts, so it keeps the most context.
+const COMPACT_KEEP_RECENT: Record<string, number> = { simple: 6, medium: 10, high: 14 };
+
+// Trigger only when the history is meaningfully longer than the keep window.
+const COMPACT_MIN_MESSAGES = 18;
+
+// Relevance floor for keeping an older message verbatim. Above this the message
+// is preserved in full; at or below it the message is folded into the digest.
+// Deliberately higher than a coin-flip so only clearly load-bearing messages
+// survive — the rest are compressed, not thrown away.
+const COMPACT_RELEVANCE_KEEP = 0.65;
+
+// Bound on how many older messages are kept verbatim for relevance, so a long
+// session cannot preserve its whole tail and defeat the compaction.
+const COMPACT_MAX_PRESERVED = 8;
+
+// The structured digest buckets: the recurring kinds of fact a coding session
+// establishes and later work depends on. Each bucket carries theme keywords used
+// to select candidate sentences from the tail; for each bucket, the tail's own
+// matching sentences become "choice" candidates and the classifier picks the most
+// representative one, so the digest preserves the SPECIFIC fact rather than merely
+// noting the topic came up. This is the extraction step: it distills the tail into
+// a small, structured record using the "choice" primitive rather than free-form
+// summarization.
+interface DigestBucket {
+  description: string;
+  keywords: string[];
+}
+const DIGEST_BUCKETS: Record<string, DigestBucket> = {
+  goal: { description: "The overall task goal, objective, or problem being solved", keywords: ["goal", "objective", "task is", "we need to", "trying to", "aim", "problem is"] },
+  architecture: { description: "Architectural structure, module boundaries, or a chosen design/approach", keywords: ["architect", "design", "structure", "module", "component", "pattern", "layer", "service", "pipeline"] },
+  requirements: { description: "Functional or non-functional requirements, scope, or acceptance criteria", keywords: ["requirement", "must", "should", "needs to", "scope", "acceptance", "criteria", "expected"] },
+  constraints: { description: "Named constraints, rules, standards, or 'must/must not' decisions to honor", keywords: ["constraint", "rule", "standard", "must not", "do not", "never", "policy", "convention", "limit"] },
+  interfaces: { description: "Defined or changed APIs, data shapes, schemas, contracts, or key signatures", keywords: ["api", "interface", "schema", "contract", "signature", "function", "type", "endpoint", "param", "returns"] },
+  decisions: { description: "A decision that was made and its rationale", keywords: ["decided", "decision", "chose", "we will use", "going with", "instead of", "because", "rationale", "tradeoff"] },
+  files: { description: "Specific files or modules that were created, changed, or are central to the work", keywords: ["file", "folder", "directory", "path", "module", "created", "edited", "added", "renamed", ".ts", ".js", ".py", ".json", ".md"] },
+  verification: { description: "Commands to build/test/lint/run, or how correctness was verified", keywords: ["test", "run", "build", "lint", "command", "npm", "bun", "pytest", "verify", "check", "passing", "failing", "suite"] },
+  state: { description: "Prior findings, bug causes, error messages, or facts established about the code", keywords: ["bug", "error", "issue", "cause", "found", "because", "fails", "broken", "root cause", "exception", "traceback"] },
+  environment: { description: "Environment or configuration details — versions, paths, ports, env vars, dependencies", keywords: ["version", "config", "environment", "port", "env", "dependency", "install", "path", "node", "python", "docker"] },
+  pending: { description: "Open questions, TODOs, or next steps agreed but not yet completed", keywords: ["todo", "next", "later", "pending", "open question", "remaining", "still need", "follow up", "unresolved"] },
+};
 
 // maxTokens per level (OpenCode sets event.options.maxTokens; on Pi the wire field
 // is injected via before_provider_request, like the pi-params package does). Opt-in
@@ -171,11 +217,6 @@ async function applyToolExposure(pi: any, prompt: string): Promise<void> {
   }
 }
 
-function isStructuralMessage(msg: any): boolean {
-  if (msg?.role === "tool" || msg?.role === "toolResult") return true;
-  return Array.isArray(msg?.content) && msg.content.some((part: any) => part?.type && part.type !== "text");
-}
-
 function messageToText(msg: any): string {
   const content = msg?.content;
   if (typeof content === "string") return content;
@@ -187,6 +228,60 @@ function messageToText(msg: any): string {
   } catch {
     return "";
   }
+}
+
+// Builds the structured digest from the compacted tail. For each bucket, the
+// tail's own sentences that match the bucket's theme become candidate values, and
+// one batched "choice" call asks the classifier to pick the single most
+// representative one — so the digest preserves the SPECIFIC fact ("auth uses
+// event-sourcing") rather than merely noting that the topic came up. Buckets with
+// no matching sentences are skipped. Returns the digest lines, or an empty array
+// when the classifier gives nothing usable (the caller then keeps the tail's most
+// relevant messages and nothing is lost outright).
+async function buildHistoryDigest(tailText: string): Promise<string[]> {
+  // Split the tail into candidate sentences and score each against every bucket's
+  // theme keywords. A sentence becomes a candidate for a bucket when it shares that
+  // bucket's keywords.
+  const sentences = tailText
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.replace(/^\[[A-Z]+\]:\s*/, "").trim())
+    .filter((s) => s.length > 20 && s.length < 400);
+
+  const questionsById: Record<string, { instructions: string; criteria: Record<string, string> }> = {};
+  const bucketSentences: Record<string, string[]> = {};
+  for (const [key, bucket] of Object.entries(DIGEST_BUCKETS)) {
+    const matches = sentences
+      .filter((s) => {
+        const low = s.toLowerCase();
+        return bucket.keywords.some((w) => low.includes(w));
+      })
+      .slice(0, 6);
+    if (matches.length === 0) continue;
+
+    const criteria: Record<string, string> = {};
+    matches.forEach((s, i) => {
+      criteria[`v${i}`] = s;
+    });
+    criteria["none"] = "None of these capture it.";
+    bucketSentences[key] = matches;
+    questionsById[key] = {
+      instructions: `From this earlier conversation, which statement best captures ${bucket.description}? Pick the single most representative one, or "none".`,
+      criteria,
+    };
+  }
+  if (Object.keys(questionsById).length === 0) return [];
+
+  const answers = await arAskChoiceMany(tailText, questionsById);
+
+  const lines: string[] = [];
+  for (const [key, bucket] of Object.entries(DIGEST_BUCKETS)) {
+    const pick = answers[key]?.choice;
+    if (!pick || pick === "none") continue;
+    const idx = Number(pick.replace(/^v/, ""));
+    const chosen = bucketSentences[key]?.[idx];
+    if (chosen) lines.push(`- ${bucket.description}: ${chosen}`);
+  }
+  return lines;
 }
 
 function extractFilePath(input: any): string | undefined {
@@ -373,7 +468,7 @@ export default function (pi: any) {
 
     const score = await arAsk(
       `User prompt: ${prompt.trim()}`,
-      "Does this prompt require deep logic thinking, complex algorithms or mathematical/concurrence bugs?",
+      "Does this prompt require deep logic thinking, complex algorithms or mathematical/concurrence bugs, multi-step refactoring, or work with many moving parts and long context the model must retain?",
     );
     if (score === null) return undefined; // classifier unavailable -> leave effort alone
 
@@ -406,44 +501,81 @@ export default function (pi: any) {
     };
   });
 
-  // ---- context: custom history pruning (OpenCode HOOK 1a, opt-in) ----
+  // ---- context: custom history compaction (OpenCode HOOK 1a, opt-in) ----
   // Pi is the one non-OpenCode agent where this is possible: the context event
-  // receives a deep copy of the messages and can return a rewritten list.
+  // receives a deep copy of the messages and can return a rewritten list. Keeps the
+  // most recent messages verbatim (keep window sized by the current level), keeps a
+  // bounded set of high-relevance older messages verbatim, and folds the remaining
+  // older messages into one structured digest so their detail is compressed rather
+  // than discarded.
   pi.on("context", async (event: any, _ctx: any) => {
-    if (!PRUNE_ENABLED) return undefined;
+    if (!COMPACT_ENABLED) return undefined;
     const messages: any[] = Array.isArray(event?.messages) ? event.messages : [];
-    if (messages.length <= PRUNE_MIN_MESSAGES) return undefined;
+    if (messages.length <= COMPACT_MIN_MESSAGES) return undefined;
 
-    const distantPast = messages.slice(0, -PRUNE_KEEP_RECENT);
-    const recentPast = messages.slice(-PRUNE_KEEP_RECENT);
-    const preserved: any[] = [];
+    const keepRecent = COMPACT_KEEP_RECENT[state.level] ?? COMPACT_KEEP_RECENT.medium;
+    const distantPast = messages.slice(0, -keepRecent);
+    const recentPast = messages.slice(-keepRecent);
 
+    // Structural messages (tool calls/results) are scored too — they dominate a
+    // long session and are the main reason it "doesn't compact enough". Only a
+    // structural message that is clearly load-bearing survives verbatim; the rest
+    // fold into the digest. The keep window still protects in-flight work.
+    const scored: Array<{ msg: any; score: number | null }> = [];
     for (const msg of distantPast) {
-      // Tool calls and their results must stay paired, so structural messages are never pruned.
-      if (isStructuralMessage(msg)) {
-        preserved.push(msg);
-        continue;
-      }
-      const text = messageToText(msg);
+      const text = messageToText(msg) || JSON.stringify(msg.content);
+      let score: number | null = null;
       try {
-        const keepProbability = await arAsk(
+        score = await arAsk(
           `Old history message:\n[${String(msg?.role).toUpperCase()}]: ${text}`,
-          "Does this message contain architectural requirements, scope definitions or crucial rules the model needs to remember to code on?",
+          "Is this message load-bearing context the model still needs — a requirement, rule, key decision, API shape, or prior finding that later work depends on? Answer YES only if losing it would change the answer.",
         );
-        // Classifier unavailable (null) preserves the message (fail open).
-        if (keepProbability === null || keepProbability > PRUNE_KEEP_THRESHOLD) {
-          preserved.push(msg);
-        } else {
-          arLog(`prune: discarded turn from [${msg?.role}]`);
-        }
       } catch {
-        preserved.push(msg);
+        score = null;
       }
+      scored.push({ msg, score });
     }
 
-    const pruned = [...preserved, ...recentPast];
-    arLog(`prune: history ${messages.length} -> ${pruned.length} messages`);
-    return { messages: pruned };
+    // Keep the highest-relevance older messages verbatim, bounded so a long
+    // session cannot preserve its whole tail. A null score (classifier
+    // unavailable) counts as relevant so we fail open, but the bound still holds.
+    const ranked = scored
+      .map((s, i) => ({ ...s, i, s: s.score ?? 1 }))
+      .sort((a, b) => b.s - a.s);
+    const preservedIdx = new Set<number>();
+    for (const r of ranked) {
+      if (preservedIdx.size >= COMPACT_MAX_PRESERVED) break;
+      if (r.s > COMPACT_RELEVANCE_KEEP) preservedIdx.add(r.i);
+    }
+    const preservedMessages = scored.filter((_, i) => preservedIdx.has(i)).map((s) => s.msg);
+    const dropped = scored.filter((_, i) => !preservedIdx.has(i));
+
+    // Structured digest of everything that did not survive verbatim.
+    const tailText = dropped
+      .map((s) => `[${String(s.msg?.role).toUpperCase()}]: ${messageToText(s.msg) || JSON.stringify(s.msg?.content)}`)
+      .join("\n")
+      .slice(0, 12_000);
+    let digestLines: string[] = [];
+    try {
+      digestLines = await buildHistoryDigest(tailText);
+    } catch {
+      digestLines = [];
+    }
+
+    const compacted: any[] = [];
+    if (digestLines.length > 0) {
+      compacted.push({
+        role: "system",
+        content: `Earlier context in this session, compacted (the messages below were folded into these facts):\n${digestLines.join("\n")}`,
+      });
+    }
+
+    const compactedMessages = [...compacted, ...preservedMessages, ...recentPast];
+    arLog(
+      `compact: history ${messages.length} -> ${compactedMessages.length} messages ` +
+        `(${recentPast.length} recent + ${preservedMessages.length} preserved + ${digestLines.length} digest facts from ${dropped.length} dropped)`,
+    );
+    return { messages: compactedMessages };
   });
 
   // ---- before_provider_request: maxTokens per level (opt-in) ----

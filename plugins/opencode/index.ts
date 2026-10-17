@@ -51,6 +51,58 @@ function classifyComplexity(score: number): EffortLevel {
   return "simple";
 }
 
+// ---- HISTORY COMPACTION (decision-driven) ----
+// Compaction keeps the most recent messages verbatim (the keep window, sized by
+// complexity level so a task in flight never loses its working context), keeps a
+// bounded set of high-relevance older messages verbatim, and turns the remaining
+// older messages into one structured digest instead of discarding their detail.
+// The digest is produced by the classifier through a "choice" decision (the
+// System One surface returns typed decisions, not prose), so nothing depends on
+// a free-text generation call.
+//
+// Keep-window (most recent messages always kept verbatim) per complexity level.
+// High-complexity work has the most moving parts, so it keeps the most context.
+const COMPACT_KEEP_RECENT: Record<EffortLevel, number> = { simple: 6, medium: 10, high: 14 };
+
+// Trigger only when the history is meaningfully longer than the keep window.
+const COMPACT_MIN_MESSAGES = 18;
+
+// Relevance floor for keeping an older message verbatim. Above this the message
+// is preserved in full; at or below it the message is folded into the digest.
+// Deliberately higher than a coin-flip so only clearly load-bearing messages
+// survive — the rest are compressed, not thrown away.
+const COMPACT_RELEVANCE_KEEP = 0.65;
+
+// Bound on how many older messages are kept verbatim for relevance, so a long
+// session cannot preserve its whole tail and defeat the compaction.
+const COMPACT_MAX_PRESERVED = 8;
+
+// The structured digest buckets: the recurring kinds of fact a coding session
+// establishes and later work depends on. Each bucket carries theme keywords used
+// to select candidate sentences from the tail; for each bucket, the tail's own
+// matching sentences become "choice" candidates and the classifier picks the most
+// representative one, so the digest preserves the SPECIFIC fact rather than merely
+// noting the topic came up. This is the extraction step: it distills the tail into
+// a small, structured record using the "choice" primitive rather than free-form
+// summarization.
+interface DigestBucket {
+  description: string;
+  keywords: string[];
+}
+const DIGEST_BUCKETS: Record<string, DigestBucket> = {
+  goal: { description: "The overall task goal, objective, or problem being solved", keywords: ["goal", "objective", "task is", "we need to", "trying to", "aim", "problem is"] },
+  architecture: { description: "Architectural structure, module boundaries, or a chosen design/approach", keywords: ["architect", "design", "structure", "module", "component", "pattern", "layer", "service", "pipeline"] },
+  requirements: { description: "Functional or non-functional requirements, scope, or acceptance criteria", keywords: ["requirement", "must", "should", "needs to", "scope", "acceptance", "criteria", "expected"] },
+  constraints: { description: "Named constraints, rules, standards, or 'must/must not' decisions to honor", keywords: ["constraint", "rule", "standard", "must not", "do not", "never", "policy", "convention", "limit"] },
+  interfaces: { description: "Defined or changed APIs, data shapes, schemas, contracts, or key signatures", keywords: ["api", "interface", "schema", "contract", "signature", "function", "type", "endpoint", "param", "returns"] },
+  decisions: { description: "A decision that was made and its rationale", keywords: ["decided", "decision", "chose", "we will use", "going with", "instead of", "because", "rationale", "tradeoff"] },
+  files: { description: "Specific files or modules that were created, changed, or are central to the work", keywords: ["file", "folder", "directory", "path", "module", "created", "edited", "added", "renamed", ".ts", ".js", ".py", ".json", ".md"] },
+  verification: { description: "Commands to build/test/lint/run, or how correctness was verified", keywords: ["test", "run", "build", "lint", "command", "npm", "bun", "pytest", "verify", "check", "passing", "failing", "suite"] },
+  state: { description: "Prior findings, bug causes, error messages, or facts established about the code", keywords: ["bug", "error", "issue", "cause", "found", "because", "fails", "broken", "root cause", "exception", "traceback"] },
+  environment: { description: "Environment or configuration details — versions, paths, ports, env vars, dependencies", keywords: ["version", "config", "environment", "port", "env", "dependency", "install", "path", "node", "python", "docker"] },
+  pending: { description: "Open questions, TODOs, or next steps agreed but not yet completed", keywords: ["todo", "next", "later", "pending", "open question", "remaining", "still need", "follow up", "unresolved"] },
+};
+
 // Z.ai GLM request fields per complexity level (models from GLM-5.2 onwards).
 // thinking toggles the chain of thought (GLM-4.6+). reasoning_effort scales it
 // (GLM-5.2+): "medium" is not a valid GLM-5.3 reasoning_effort, so the medium level maps to "high".
@@ -879,11 +931,6 @@ function contentToText(content: unknown): string {
   return "";
 }
 
-function isStructuralMessage(msg: any): boolean {
-  if (msg?.role === "tool") return true;
-  return Array.isArray(msg?.content) && msg.content.some((part: any) => part?.type && part.type !== "text");
-}
-
 // Asks a yes/no question to a System One endpoint (the local runtimes' System One
 // API, the TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen — all
 // serve the same shape at <baseURL>/systemone) and returns P(YES) in [0, 1].
@@ -1056,6 +1103,128 @@ async function askSystemOneChoice(
     }
   }
   return primary;
+}
+
+// Batched "choice" decisions: one request carrying a question per id, each with
+// its own criteria, answered in a single round-trip. Used by history compaction to
+// extract every digest bucket at once. Ids the backend did not answer are omitted,
+// so a caller can tell a backend that only honors a single question and degrade
+// gracefully. Falls back to fallbackModel when the primary returns nothing usable.
+async function askSystemOneChoiceMany(
+  config: SystemOneConfig,
+  state: string,
+  questionsById: Record<string, { instructions: string; criteria: Record<string, string> }>,
+): Promise<Record<string, ChoiceAnswer>> {
+  const ids = Object.keys(questionsById);
+  if (ids.length === 0) return {};
+
+  const ask = async (model: string): Promise<Record<string, ChoiceAnswer> | null> => {
+    const questions: Record<string, any> = {};
+    for (const id of ids) {
+      questions[id] = { type: "choice", instructions: questionsById[id].instructions, criteria: questionsById[id].criteria };
+    }
+    const response = await fetch(`${config.baseURL}/systemone`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(config.apiKey ? { "Authorization": `Bearer ${config.apiKey}` } : {}),
+      },
+      body: JSON.stringify({ model, state, questions }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as any;
+    const out: Record<string, ChoiceAnswer> = {};
+    for (const id of ids) {
+      const answer = data.answers?.[id];
+      if (!answer || answer.type !== "choice") continue;
+      const probabilities: Record<string, number> = {};
+      if (answer.probabilities && typeof answer.probabilities === "object") {
+        for (const [key, value] of Object.entries(answer.probabilities)) {
+          const n = Number(value);
+          if (Number.isFinite(n)) probabilities[key] = n;
+        }
+      }
+      out[id] = {
+        choice: typeof answer.choice === "string" ? answer.choice : null,
+        probabilities,
+        confidence: Number.isFinite(Number(answer.confidence)) ? Number(answer.confidence) : null,
+      };
+    }
+    return out;
+  };
+
+  let primary: Record<string, ChoiceAnswer> | null;
+  try {
+    primary = await ask(config.model);
+  } catch {
+    primary = null;
+  }
+  if (primary && Object.keys(primary).length > 0) return primary;
+
+  if (config.fallbackModel && config.fallbackModel !== config.model) {
+    try {
+      return (await ask(config.fallbackModel)) ?? {};
+    } catch {
+      return primary ?? {};
+    }
+  }
+  return primary ?? {};
+}
+
+// Builds the structured digest from the compacted tail. For each bucket, the
+// tail's own sentences that match the bucket's theme become candidate values, and
+// one batched "choice" call asks the classifier to pick the single most
+// representative one — so the digest preserves the SPECIFIC fact ("auth uses
+// event-sourcing") rather than merely noting that the topic came up. Buckets with
+// no matching sentences are skipped. Returns the digest lines, or an empty array
+// when the classifier gives nothing usable (the caller then keeps the tail's most
+// relevant messages and nothing is lost outright).
+async function buildHistoryDigest(config: SystemOneConfig, tailText: string): Promise<string[]> {
+  // Split the tail into candidate sentences and score each against every bucket's
+  // theme keywords. A sentence becomes a candidate for a bucket when it shares that
+  // bucket's keywords.
+  const sentences = tailText
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.replace(/^\[[A-Z]+\]:\s*/, "").trim())
+    .filter((s) => s.length > 20 && s.length < 400);
+
+  const questionsById: Record<string, { instructions: string; criteria: Record<string, string> }> = {};
+  const bucketSentences: Record<string, string[]> = {};
+  for (const [key, bucket] of Object.entries(DIGEST_BUCKETS)) {
+    const matches = sentences
+      .filter((s) => {
+        const low = s.toLowerCase();
+        return bucket.keywords.some((w) => low.includes(w));
+      })
+      .slice(0, 6);
+    if (matches.length === 0) continue;
+
+    const criteria: Record<string, string> = {};
+    matches.forEach((s, i) => {
+      criteria[`v${i}`] = s;
+    });
+    criteria["none"] = "None of these capture it.";
+    bucketSentences[key] = matches;
+    questionsById[key] = {
+      instructions: `From this earlier conversation, which statement best captures ${bucket.description}? Pick the single most representative one, or "none".`,
+      criteria,
+    };
+  }
+  if (Object.keys(questionsById).length === 0) return [];
+
+  const answers = await askSystemOneChoiceMany(config, tailText, questionsById);
+
+  const lines: string[] = [];
+  for (const [key, bucket] of Object.entries(DIGEST_BUCKETS)) {
+    const pick = answers[key]?.choice;
+    if (!pick || pick === "none") continue;
+    const idx = Number(pick.replace(/^v/, ""));
+    const chosen = bucketSentences[key]?.[idx];
+    if (chosen) lines.push(`- ${bucket.description}: ${chosen}`);
+  }
+  return lines;
 }
 
 // ============ TOOL EXPOSURE (give the model only the tools a task needs) ============
@@ -1507,77 +1676,116 @@ export default Plugin.define({
       const messages = event.messages || [];
       if (messages.length < 1) return;
 
-      // ---- SUB-ROUTINE A: CUSTOM COMPACTION ----
-      if (messages.length > 16) {
-        console.log(`\n[System One]: Analyzing token relevance for history pruning...`);
+      // ---- COMPLEXITY CLASSIFICATION (shared by compaction + parameter modulation) ----
+      // Classified once per request. It sizes the compaction keep window and drives
+      // maxTokens / the confidence suggestion below. Kept as (level, score) so the
+      // request is classified with a single classifier round-trip.
+      const lastMessage0 = messages[messages.length - 1];
+      const userPrompt0 = contentToText(lastMessage0?.content);
+      let level: EffortLevel = "medium";
+      let complexityScore: number | null = null;
+      if (userPrompt0 && !userPrompt0.includes("[object Object]")) {
+        try {
+          complexityScore = await askSystemOne(
+            config,
+            `User prompt: ${userPrompt0.trim()}`,
+            "Does this prompt require deep logic thinking, complex algorithms or mathematical/concurrence bugs?"
+          );
+          if (complexityScore !== null) level = classifyComplexity(complexityScore);
+        } catch {
+          complexityScore = null;
+        }
+      }
 
-        const distantPast = messages.slice(0, -4);
-        const recentPast = messages.slice(-4);
-        const preservedMessages: any[] = [];
+      // ---- SUB-ROUTINE A: DECISION-DRIVEN HISTORY COMPACTION ----
+      // Keeps the most recent messages verbatim (keep window sized by the level),
+      // keeps a bounded set of high-relevance older messages verbatim, and folds
+      // the remaining older messages into one structured digest so their detail is
+      // compressed rather than discarded.
+      if (messages.length > COMPACT_MIN_MESSAGES) {
+        const keepRecent = COMPACT_KEEP_RECENT[level];
+        const distantPast = messages.slice(0, -keepRecent);
+        const recentPast = messages.slice(-keepRecent);
 
-        // Avalia individualmente quais mensagens merecem ser mantidas
+        // Structural messages (tool calls/results) are scored too — they dominate a
+        // long session and are the main reason it "doesn't compact enough". Only a
+        // structural message that is clearly load-bearing survives verbatim; the
+        // rest fold into the digest. The keep window still protects in-flight work.
+        const scored: Array<{ msg: any; score: number | null }> = [];
         for (const msg of distantPast) {
-          // Tool calls and their results must stay paired, so structural messages are never pruned
-          if (isStructuralMessage(msg)) {
-            preservedMessages.push(msg);
-            continue;
-          }
-
           const msgContent = contentToText(msg.content) || JSON.stringify(msg.content);
-
+          let score: number | null = null;
           try {
-            // Decisão binária: preserva se a probabilidade de relevância for maior que 40%
-            const keepProbability = await askSystemOne(
+            score = await askSystemOne(
               config,
               `Old history message:\n[${String(msg.role).toUpperCase()}]: ${msgContent}`,
-              "Does this message contain architectural requirements, scope definitions or crucial rules the model needs to remember to code on?"
+              "Is this message load-bearing context the model still needs — a requirement, rule, key decision, API shape, or prior finding that later work depends on? Answer YES only if losing it would change the answer."
             );
-
-            // Fallback de segurança (null) preserva a mensagem
-            if (keepProbability === null || keepProbability > 0.40) {
-              preservedMessages.push(msg);
-            } else {
-              console.log(`[System One Prune]: Discarding redundant turn from [${msg.role}].`);
-            }
           } catch {
-            preservedMessages.push(msg);
+            score = null;
           }
+          scored.push({ msg, score });
         }
 
-        // Substitui o histórico pesado apenas pelas mensagens sobreviventes + contexto recente
-        event.messages = [...preservedMessages, ...recentPast];
-        console.log(`[System One]: Pruning complete. History optimized to ${event.messages.length} turns.`);
+        // Keep the highest-relevance older messages verbatim, bounded so a long
+        // session cannot preserve its whole tail. A null score (classifier
+        // unavailable) counts as relevant so we fail open, but the bound still holds.
+        const ranked = scored
+          .map((s, i) => ({ ...s, i, s: s.score ?? 1 }))
+          .sort((a, b) => b.s - a.s);
+        const preservedIdx = new Set<number>();
+        for (const r of ranked) {
+          if (preservedIdx.size >= COMPACT_MAX_PRESERVED) break;
+          if (r.s > COMPACT_RELEVANCE_KEEP) preservedIdx.add(r.i);
+        }
+        const preservedMessages = scored.filter((_, i) => preservedIdx.has(i)).map((s) => s.msg);
+        const dropped = scored.filter((_, i) => !preservedIdx.has(i));
+
+        // Structured digest of everything that did not survive verbatim.
+        const tailText = dropped
+          .map((s) => `[${String(s.msg.role).toUpperCase()}]: ${contentToText(s.msg.content) || JSON.stringify(s.msg.content)}`)
+          .join("\n")
+          .slice(0, 12_000);
+        let digestLines: string[] = [];
+        try {
+          digestLines = await buildHistoryDigest(config, tailText);
+        } catch {
+          digestLines = [];
+        }
+
+        const compacted: any[] = [];
+        if (digestLines.length > 0) {
+          compacted.push({
+            role: "system",
+            type: "text",
+            content: `Earlier context in this session, compacted (the messages below were folded into these facts):\n${digestLines.join("\n")}`,
+          });
+        }
+
+        event.messages = [...compacted, ...preservedMessages, ...recentPast];
+        console.log(
+          `[System One]: History compacted to ${event.messages.length} turns ` +
+            `(${recentPast.length} recent + ${preservedMessages.length} preserved + ${digestLines.length} digest facts from ${dropped.length} messages).`
+        );
       }
 
       // ---- SUB-ROUTINE B: PRE-EVALUATION AND COMPLEXITY INJECTION ----
-      const lastMessage = event.messages[event.messages.length - 1];
-      const userPrompt = contentToText(lastMessage.content);
-
-      if (!userPrompt || userPrompt.includes("[object Object]")) return;
-
-      try {
-        const score = await askSystemOne(
-          config,
-          `User prompt: ${userPrompt.trim()}`,
-          "Does this prompt require deep logic thinking, complex algorithms or mathematical/concurrence bugs?"
-        );
-        if (score === null) return;
-
-        const level = classifyComplexity(score);
+      // Uses the shared classification computed at the top of this hook (one
+      // classifier call per request) to set maxTokens and suggest the confidence
+      // tool on medium/high tasks.
+      if (complexityScore !== null) {
         levelBySession.set(event.sessionID, level);
         event.options.maxTokens = LEVEL_REQUEST[level].maxTokens;
 
         if (level === "simple") {
-          console.log(`[System One]: Simple task (${(score * 100).toFixed(0)}%). Optimizing for speed.`);
+          console.log(`[System One]: Simple task (${(complexityScore * 100).toFixed(0)}%). Optimizing for speed.`);
         } else {
-          console.log(`[System One]: ${level} complexity (${(score * 100).toFixed(0)}%). Optimizing for deep thinking.`);
+          console.log(`[System One]: ${level} complexity (${(complexityScore * 100).toFixed(0)}%). Optimizing for deep thinking.`);
           event.system.push({
             type: "text",
             text: `This is a ${level} complexity task. Before committing to a solution, consider calling the ${CONFIDENCE_TOOL} tool with your current plan and follow its verdict.`,
           });
         }
-      } catch (error: any) {
-        console.warn(`[Modulator Warning]: Failed to modulate parameters: ${error.message}`);
       }
 
       // ---- SUB-ROUTINE C: TOOL EXPOSURE (only the tools this task needs) ----

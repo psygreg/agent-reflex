@@ -2,11 +2,11 @@
 
 Pi port of the `agent-reflex` OpenCode plugin: a small System One decision model
 runs alongside the agent to safeguard shell commands, double-check edits, tune
-effort per task, prune history, and let the model sanity-check its own reasoning.
+effort per task, compact history, and let the model sanity-check its own reasoning.
 
 Pi is the most extensible agent this plugin ports to, and the **only one** where
 the two OpenCode-only features on every other port actually work: dynamic effort
-and custom history pruning. Install it into `~/.pi/agent/extensions/agent-reflex/`
+and decision-driven history compaction. Install it into `~/.pi/agent/extensions/agent-reflex/`
 (the installer does this), and create `agent-reflex.jsonc` in the plugin root with
 your classifier settings.
 
@@ -19,11 +19,14 @@ your classifier settings.
   replaces the OpenCode plugin's hand-rolled per-vendor dialects (GLM, MiMo,
   Gemini, Qwen, Kimi, Grok, MiniMax…). This is the plugin's headline feature and it works
   at full fidelity here.
-- **Custom history pruning** (`context`, opt-in): when the history grows long,
-  scores each old message with the classifier and drops the redundant ones,
-  preserving structural (tool call/result) messages and the recent tail. The
-  `context` event receives a deep copy of the message list and can return a
-  rewritten one — the one capability no other non-OpenCode agent exposes.
+- **Decision-driven history compaction** (`context`, opt-in): when the history
+  grows long, keeps the recent messages verbatim (a keep-window that widens with
+  complexity), keeps a bounded set of load-bearing older messages, and folds the
+  rest into a compact structured digest of the facts they established — so detail
+  is compressed rather than discarded. Structural (tool call/result) messages are
+  scored like any other and only survive when load-bearing. The `context` event
+  receives a deep copy of the message list and can return a rewritten one — the
+  one capability no other non-OpenCode agent exposes.
 - **Shell guardrail** (`tool_call`): scores a command for damage potential and
   blocks it (`{ block: true }`) before it runs. A real block, like Claude
   Code/Codex/Qwen Code/Antigravity.
@@ -76,7 +79,7 @@ Two features carry real cost or override provider defaults, so they are opt-in:
 
 | Flag | Effect |
 |---|---|
-| `AGENT_REFLEX_PRUNE=1` | Enable history pruning (`context`). Makes one classifier call per old message before every model request — real latency and token cost. Off by default. |
+| `AGENT_REFLEX_PRUNE=1` | Enable decision-driven history compaction (`context`). One classifier call per old message plus one batched digest call per model request — real latency and token cost. Off by default. |
 | `AGENT_REFLEX_MAXTOKENS=1` | Set the request token cap per level (`before_provider_request`), matching the plugin's `maxTokens` (simple 8192, medium 65536, high 131072). Overrides the provider's own cap. Off by default. |
 | `AGENT_REFLEX_TOOLS=0` | Disable tool exposure. When set to `0` (or `all`), every tool stays exposed. On by default (`auto`); makes one classifier batch call per prompt to score the tools. |
 

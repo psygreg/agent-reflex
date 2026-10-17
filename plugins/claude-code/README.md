@@ -19,8 +19,13 @@ plugin (in the plugin root) with your classifier settings.
   fix; a second failure on the same file asks the user how to proceed.
 - **Complexity classification** (`UserPromptSubmit`): scores each prompt
   *simple*/*medium*/*high* and, on medium/high, suggests a confidence check.
-- **Compaction guidance** (`PreCompact`): steers Claude Code's own compaction to
-  keep architectural requirements, scope, and rules.
+- **Compaction guidance with fact extraction** (`PreCompact`): reads the
+  conversation transcript (`transcript_path`), extracts the facts it established
+  (goal, architecture, decisions, files, verification, and the other digest
+  buckets) with the classifier, and steers Claude Code's own summarizer via
+  `custom_instructions` to preserve them. Falls back to enriched static guidance
+  when the transcript is unavailable. Guidance only — it cannot choose what to
+  keep, just what the summary preserves.
 - **Confidence check** (`/confidence` skill): scores the model's current line of
   thought and returns CONTINUE or RESTART.
 
@@ -58,10 +63,12 @@ equivalent here and are intentionally omitted:
   picker — see claude-code issue #30806). The classifier still classifies
   complexity here, but only to drive the confidence suggestion and the post-edit
   check depth, not the request.
-- **Custom history pruning.** The OpenCode plugin prunes old messages from the
-  request before each model call. Claude Code owns compaction and does not let a
-  hook rewrite the conversation history, so this plugin can only bias compaction
-  via `PreCompact` `custom_instructions`.
+- **Decision-driven history compaction.** The OpenCode plugin keeps/drops messages
+  and folds the tail into a digest before each model call. Claude Code owns
+  compaction and does not let a hook rewrite the conversation history, so this
+  plugin cannot select what to keep. It approximates the digest step instead:
+  `PreCompact` reads the transcript, extracts the same fact buckets, and biases the
+  summary to preserve them via `custom_instructions`.
 
 If you need those two features, use the OpenCode plugin (`plugins/opencode`).
 

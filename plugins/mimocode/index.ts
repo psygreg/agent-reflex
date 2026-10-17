@@ -6,7 +6,7 @@
 // community hook surface adds three hooks OpenCode lacks, which let this port reach
 // features the shell-based ports (Claude Code, Codex, Antigravity) cannot:
 //   - chat.params                 -> maxTokens per level (the plugin's level cap).
-//   - experimental.chat.messages.transform -> custom history pruning (HOOK 1a).
+//   - experimental.chat.messages.transform -> decision-driven history compaction (HOOK 1a).
 //   - experimental.session.compacting     -> compaction guidance (HOOK 1a's sibling).
 //
 // One honest caveat: chat.params exposes maxOutputTokens but NOT reasoning_effort
@@ -16,7 +16,7 @@
 // MiMo Code loads file hooks from hooks/*.ts (the "plugin" array does NOT execute
 // module code — a documented gotcha), compiling them with Bun.build and hot-reloading.
 
-import { arAsk, classifyLevel, arLog, levelBySession } from "./classifier";
+import { arAsk, classifyLevel, arLog, levelBySession, buildHistoryDigest } from "./classifier";
 import { findSyntaxErrors, excerptAroundEdit, readFileText, CONTEXT_LINES } from "./check";
 
 // Level -> generated-token cap. Mirrors the plugin's LEVEL_REQUEST.maxTokens.
@@ -27,18 +27,32 @@ const LEVEL_MAX_TOKENS: Record<string, number> = { simple: 8192, medium: 65536, 
 const GUARD_THRESHOLD = Number(process.env.AGENT_REFLEX_GUARD_THRESHOLD ?? "0.75");
 const SEMANTIC_THRESHOLD = Number(process.env.AGENT_REFLEX_SEMANTIC_THRESHOLD ?? "0.75");
 
-// History pruning (HOOK 1a) is opt-in: one classifier call per old message before
-// every model request is real latency/cost. Enable with AGENT_REFLEX_PRUNE=1.
+// History compaction (HOOK 1a) is opt-in: one classifier call per old message plus
+// one batched digest call per model request is real latency/cost. Enable with
+// AGENT_REFLEX_PRUNE=1.
 const PRUNE_ENABLED = process.env.AGENT_REFLEX_PRUNE === "1";
-const PRUNE_MIN_MESSAGES = 16;
-const PRUNE_KEEP_RECENT = 4;
-const PRUNE_KEEP_THRESHOLD = 0.4;
 
+// ---- decision-driven history compaction (ported from the plugin) ----
+// Compaction keeps the most recent messages verbatim (the keep window, sized by
+// complexity level so a task in flight never loses its working context), keeps a
+// bounded set of high-relevance older messages verbatim, and folds the remaining
+// older messages into one structured digest instead of discarding their detail.
+// The digest is produced by the classifier through "choice" decisions, so nothing
+// depends on a free-text generation call. Mirrors the plugin's compaction constants.
+// Keep-window (most recent messages always kept verbatim) per complexity level.
+// High-complexity work has the most moving parts, so it keeps the most context.
+const COMPACT_KEEP_RECENT: Record<string, number> = { simple: 6, medium: 10, high: 14 };
+// Trigger only when the history is meaningfully longer than the keep window.
+const COMPACT_MIN_MESSAGES = 18;
+// Relevance score for keeping an older message verbatim (above this it is preserved
+// in full; at or below it the message is folded into the digest). Deliberately higher
+// than a coin-flip so only clearly load-bearing messages survive — the rest are
+// compressed, not thrown away.
+const COMPACT_RELEVANCE_KEEP = 0.65;
+// Bound on how many older messages are kept verbatim for relevance, so a long
+// session cannot preserve its whole tail and defeat the compaction.
+const COMPACT_MAX_PRESERVED = 8;
 
-function isStructuralMessage(msg: any): boolean {
-  if (msg?.role === "tool" || msg?.role === "toolResult") return true;
-  return Array.isArray(msg?.content) && msg.content.some((part: any) => part?.type && part.type !== "text");
-}
 
 function contentToText(content: any): string {
   if (typeof content === "string") return content;
@@ -88,42 +102,80 @@ export default {
     }
   },
 
-  // ---- experimental.chat.messages.transform: custom history pruning (HOOK 1a) ----
+  // ---- experimental.chat.messages.transform: decision-driven history compaction (HOOK 1a) ----
   // MiMo Code lets a hook return a rewritten message list — the capability the shell
-  // ports lack. Opt-in via AGENT_REFLEX_PRUNE=1 (one classifier call per old message).
+  // ports lack. This is the plugin's SUB-ROUTINE A: keep the recent tail verbatim
+  // (sized by the session's complexity level), keep a bounded set of high-relevance
+  // older messages verbatim, and fold the rest into one structured digest so their
+  // detail is compressed rather than discarded. Opt-in via AGENT_REFLEX_PRUNE=1
+  // (one classifier call per old message + one batched digest call per request).
   "experimental.chat.messages.transform": async (input: any, output: any) => {
     if (!PRUNE_ENABLED) return;
     const messages: any[] = Array.isArray(output?.messages) ? output.messages : Array.isArray(input?.messages) ? input.messages : [];
-    if (messages.length <= PRUNE_MIN_MESSAGES) return;
+    // Keep-window sized by the session's complexity level (defaults to simple when
+    // the level is unknown), so a task in flight never loses its working context.
+    const level = String(input?.sessionID ? (levelBySession.get(input.sessionID) ?? "simple") : "simple");
+    const keepRecent = COMPACT_KEEP_RECENT[level] ?? COMPACT_KEEP_RECENT.simple;
+    if (messages.length <= COMPACT_MIN_MESSAGES) return;
 
-    const distantPast = messages.slice(0, -PRUNE_KEEP_RECENT);
-    const recentPast = messages.slice(-PRUNE_KEEP_RECENT);
-    const preserved: any[] = [];
+    const distantPast = messages.slice(0, -keepRecent);
+    const recentPast = messages.slice(-keepRecent);
 
+    // Score every distant message for relevance (structural tool messages included —
+    // they dominate a long session). A null score (classifier unavailable) counts as
+    // relevant so we fail open, but the preserve bound below still holds.
+    const scored: Array<{ msg: any; score: number | null }> = [];
     for (const msg of distantPast) {
-      if (isStructuralMessage(msg)) {
-        preserved.push(msg);
-        continue;
-      }
       const text = contentToText(msg?.content) || JSON.stringify(msg?.content ?? "");
+      let score: number | null = null;
       try {
-        const keepProbability = await arAsk(
+        score = await arAsk(
           `Old history message:\n[${String(msg?.role).toUpperCase()}]: ${text}`,
-          "Does this message contain architectural requirements, scope definitions or crucial rules the model needs to remember to code on?",
+          "Is this message load-bearing context the model still needs — a requirement, rule, key decision, API shape, or prior finding that later work depends on? Answer YES only if losing it would change the answer.",
         );
-        if (keepProbability === null || keepProbability > PRUNE_KEEP_THRESHOLD) {
-          preserved.push(msg);
-        } else {
-          arLog(`prune: discarded turn from [${msg?.role}]`);
-        }
       } catch {
-        preserved.push(msg);
+        score = null;
       }
+      scored.push({ msg, score });
     }
 
-    const pruned = [...preserved, ...recentPast];
-    arLog(`prune: history ${messages.length} -> ${pruned.length} messages`);
-    output.messages = pruned;
+    // Keep the highest-relevance older messages verbatim, bounded so a long session
+    // cannot preserve its whole tail.
+    const ranked = scored
+      .map((s, i) => ({ ...s, i, s: s.score ?? 1 }))
+      .sort((a, b) => b.s - a.s);
+    const preservedIdx = new Set<number>();
+    for (const r of ranked) {
+      if (preservedIdx.size >= COMPACT_MAX_PRESERVED) break;
+      if (r.s > COMPACT_RELEVANCE_KEEP) preservedIdx.add(r.i);
+    }
+    const preservedMessages = scored.filter((_, i) => preservedIdx.has(i)).map((s) => s.msg);
+    const dropped = scored.filter((_, i) => !preservedIdx.has(i));
+
+    // Structured digest of everything that did not survive verbatim.
+    const tailText = dropped
+      .map((s) => `[${String(s.msg?.role).toUpperCase()}]: ${contentToText(s.msg?.content) || JSON.stringify(s.msg?.content ?? "")}`)
+      .join("\n")
+      .slice(0, 12_000);
+    let digestLines: string[] = [];
+    try {
+      digestLines = await buildHistoryDigest(tailText);
+    } catch {
+      digestLines = [];
+    }
+
+    const compacted: any[] = [];
+    if (digestLines.length > 0) {
+      compacted.push({
+        role: "system",
+        type: "text",
+        content: `Earlier context in this session, compacted (the messages below were folded into these facts):\n${digestLines.join("\n")}`,
+      });
+    }
+
+    const compactedList = [...compacted, ...preservedMessages, ...recentPast];
+    arLog(`compact: history ${messages.length} -> ${compactedList.length} messages (${recentPast.length} recent + ${preservedMessages.length} preserved + ${digestLines.length} digest facts from ${dropped.length} messages)`);
+    output.messages = compactedList;
   },
 
   // ---- experimental.chat.system.transform: complexity classification + suggestion ----

@@ -109,6 +109,66 @@ ar_ask() {
   return 1
 }
 
+# ask_one_choice MODEL STATE QUESTION CRITERIA_JSON -> prints the chosen key or nothing.
+# A "choice" decision: the model picks one key from named criteria. CRITERIA_JSON is a
+# JSON object {key: description}.
+ar_ask_choice_model() {
+  local model="$1" state="$2" question="$3" criteria="$4" base key body
+  base="$(ar_base_url)"; [ -n "$base" ] || return 1
+  key="$(ar_resolve_env "$(ar_config apiKey)")"
+
+  body="$(jq -nc --arg m "$model" --arg s "$state" --arg q "$question" --argjson c "$criteria" \
+    '{model:$m, state:$s, questions:{q:{type:"choice", instructions:$q, criteria:$c}}}')"
+
+  local hdr=(-H "Content-Type: application/json")
+  [ -n "$key" ] && hdr+=(-H "Authorization: Bearer ${key}")
+
+  local resp
+  resp="$(curl -sS --max-time "${AGENT_REFLEX_TIMEOUT:-20}" "${hdr[@]}" \
+    -d "$body" "${base}/systemone" 2>/dev/null)" || return 1
+
+  echo "$resp" | jq -r '.answers.q.choice // empty' 2>/dev/null
+}
+
+# ask_choice_many STATE QUESTIONS_JSON MODEL -> prints a JSON map {id: choice} (empty values
+# dropped). QUESTIONS_JSON is {id: {instructions, criteria}}. One round-trip, one question per id.
+ar_ask_choice_many_model() {
+  local state="$1" questions="$2" model="$3" base key body
+  base="$(ar_base_url)"; [ -n "$base" ] || return 1
+  key="$(ar_resolve_env "$(ar_config apiKey)")"
+
+  body="$(jq -nc --arg m "$model" --arg s "$state" --argjson q "$questions" \
+    '{model:$m, state:$s, questions: ($q | with_entries(.value.type = "choice"))}')"
+
+  local hdr=(-H "Content-Type: application/json")
+  [ -n "$key" ] && hdr+=(-H "Authorization: Bearer ${key}")
+
+  local resp
+  resp="$(curl -sS --max-time "${AGENT_REFLEX_TIMEOUT:-20}" "${hdr[@]}" \
+    -d "$body" "${base}/systemone" 2>/dev/null)" || return 1
+
+  echo "$resp" | jq -c '[.answers // {} | to_entries[] | select(.value.choice != null) | {(.key): .value.choice}] | add // {}' 2>/dev/null
+}
+
+# ask_choice_many STATE QUESTIONS_JSON -> falls back to fallbackModel when the primary
+# returns nothing usable. Prints a JSON map {id: choice}.
+ar_ask_choice_many() {
+  local state="$1" questions="$2" model fallback out
+  model="$(ar_config model)"
+  [ -n "$model" ] || { echo "{}"; return 1; }
+
+  out="$(ar_ask_choice_many_model "$state" "$questions" "$model")"
+  if [ -n "$out" ] && [ "$out" != "{}" ]; then echo "$out"; return 0; fi
+
+  fallback="$(ar_config fallbackModel)"
+  if [ -n "$fallback" ] && [ "$fallback" != "$model" ]; then
+    out="$(ar_ask_choice_many_model "$state" "$questions" "$fallback")"
+    if [ -n "$out" ] && [ "$out" != "{}" ]; then echo "$out"; return 0; fi
+  fi
+  echo "{}"
+  return 1
+}
+
 # ---- logging ----
 ar_log() {
   local dbg; dbg="$(ar_config debugLog)"

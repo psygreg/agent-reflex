@@ -37,9 +37,13 @@ capability below is driven by this classifier.
 
 ## Capabilities (brief the user with this)
 
-- **Decision-driven history compaction**: when the conversation exceeds 16
-  messages, each old message is scored by the classifier and dropped when it is
-  unlikely to matter; structural messages (tool calls/results) always survive.
+- **Decision-driven history compaction**: when the history grows long, the
+  recent messages are kept verbatim (a keep-window that widens with the task's
+  complexity), the most load-bearing older messages are kept too (bounded, so a
+  long session cannot preserve its whole tail), and the rest are folded into a
+  compact structured digest of the facts they established — so detail is
+  compressed rather than discarded. Structural messages (tool calls/results) are
+  scored like any other and only survive when load-bearing.
 - **Complexity classification**: every prompt is scored *simple*, *medium* or
   *high*; `maxTokens` is set per level and medium/high prompts get a system
   note suggesting a confidence check before committing to a solution.
@@ -98,16 +102,18 @@ present. The classifier config is shared (`agent-reflex.jsonc`, same option
 names), so the user answers the classifier questions once.
 
 Which features reach each agent — and with what caveat — is in the table below.
-The two features that require rewriting the model request (dynamic effort and
-custom history pruning) only reach agents whose hook API can do that:
+Dynamic effort needs the plugin to rewrite the model request, and history
+compaction needs it to rewrite the message list — both only reach agents whose hook
+API allows that rewrite. OpenCode, Pi and MiMo Code all share the same
+decision-driven compaction (Pi and MiMo Code gate it behind `AGENT_REFLEX_PRUNE=1`):
 
-| Agent | Guardrail | Post-edit checks | Compaction guidance | Dynamic effort | History pruning | Tool exposure | Tool dispatch | Key caveat |
+| Agent | Guardrail | Post-edit checks | Compaction guidance | Dynamic effort | History compaction | Tool exposure | Tool dispatch | Key caveat |
 |---|---|---|---|---|---|---|---|---|
-| OpenCode | hard block | inline | built-in | full (per-model dialects) | pruning | yes | yes (`reflex_run`) | Reference implementation; everything works. |
-| Pi | hard block | inline | via `context` | full (`setThinkingLevel`) | opt-in | yes (`setActiveTools`) | yes (`reflex_run`) | Pi translates the effort level per model itself. |
-| MiMo Code | hard block | inline | compacting hook | token cap only | opt-in | no | no | `chat.params` has `maxTokens` but no `reasoning_effort`. |
-| Claude Code | hard block | inline | `custom_instructions` | no | no | no | no | Hooks cannot rewrite the request or the message list. |
-| Qwen Code | hard block | inline | `custom_instructions` | no | no | no | no | Same hook limits as Claude Code. |
+| OpenCode | hard block | inline | built-in | full (per-model dialects) | decision-driven | yes | yes (`reflex_run`) | Reference implementation; everything works. |
+| Pi | hard block | inline | via `context` | full (`setThinkingLevel`) | opt-in decision-driven | yes (`setActiveTools`) | yes (`reflex_run`) | Pi translates the effort level per model itself. |
+| MiMo Code | hard block | inline | compacting hook | token cap only | opt-in decision-driven | no | no | `chat.params` has `maxTokens` but no `reasoning_effort`. |
+| Claude Code | hard block | inline | fact-extraction guidance | no | digest guidance only | no | no | `PreCompact` extracts fact buckets from the transcript to steer the summary, but cannot rewrite the message list. |
+| Qwen Code | hard block | inline | fact-extraction guidance | no | digest guidance only | no | no | Same hook limits as Claude Code. |
 | Codex | hard block | inline | inert | no | no | no | no | Compaction hook can only cancel compaction; edits via `apply_patch` (V4A). |
 | Antigravity | hard block | one turn late | inert | no | no | no | no | `PostToolUse` cannot inject context (antigravity-cli#808). |
 | Hermes | wrapper tool | inline | none | no | no | no | no | Hooks cannot block a tool call; guardrail is a `safe_run` wrapper. |
