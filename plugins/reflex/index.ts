@@ -44,7 +44,7 @@ const LEVEL_REQUEST = {
 
 type EffortLevel = keyof typeof LEVEL_REQUEST;
 
-// Complexity score cut-offs: above 0.60 is medium, above 0.85 is high.
+// Complexity score cut-offs: above 0.50 is medium, above 0.80 is high.
 function classifyComplexity(score: number): EffortLevel {
   if (score > 0.80) return "high";
   if (score > 0.50) return "medium";
@@ -228,6 +228,77 @@ function applyMimoLevel(body: any, level: EffortLevel, url: string): boolean {
   return false;
 }
 
+// Google Gemini levels per complexity level (Gemini 3 onwards, thinkingLevel).
+// Thinking cannot be fully disabled on Gemini 3+ and "minimal" is deliberately
+// not used: it errors on Gemini 3.8+ and Gemini 4, while "low" is Google's
+// documented latency/cost tier and is supported everywhere.
+const GEMINI_LEVEL_REQUEST = {
+  simple: "low",
+  medium: "medium",
+  high: "high",
+} as const;
+
+// Matches "gemini-3-flash-preview", "gemini-3.1-pro-preview", "gemini-3.8-flash",
+// "gemini-4-argon", "google/gemini-3.5-flash-lite"... Only Gemini 3 onwards: the
+// 2.5 generation speaks the older thinkingBudget instead of thinkingLevel.
+// Media/specialist variants (image, tts, live, audio, speech, robotics) have
+// their own level sets and stay untouched, as do versionless aliases.
+function parseGeminiModel(model: unknown): { supportsMedium: boolean } | null {
+  if (typeof model !== "string") return null;
+  const id = model.toLowerCase();
+  if (/(?:image|tts|live|audio|speech|robotics)/.test(id)) return null;
+  const match = id.match(/(?:^|[^a-z])gemini[-_.\s]?v?(\d+)(?:[-_.](\d+))?(?!\d)/);
+  if (!match) return null;
+  const major = parseInt(match[1], 10);
+  const minor = match[2] ? parseInt(match[2], 10) : 0;
+  if (major < 3) return null;
+  // gemini-3-pro (3.0) supports only "low" and "high"; every later model adds "medium".
+  return { supportsMedium: !(major === 3 && minor === 0 && /pro/.test(id)) };
+}
+
+// Google-style endpoints carry the model in the path (/models/{model}:action)
+// instead of the request body.
+function modelFromGooglePath(url: string): string | null {
+  return url.split(/[?#]/, 1)[0].match(/\/models\/([^/:]+)(?::|$)/)?.[1] ?? null;
+}
+
+// Applies the session's level to a Google Gemini request body (in place).
+// Returns false when the request must stay untouched (not a Gemini 3+ model, or
+// an endpoint shape Gemini does not serve). The field dialect:
+// - :generateContent / :streamGenerateContent (Google AI, Vertex AI and the
+//   OpenCode Go google route): generationConfig.thinkingConfig.thinkingLevel.
+//   Gemini 3+ rejects thinkingBudget and thinkingLevel together (verified live
+//   through Go: "You can only set only one of thinking budget and thinking
+//   level"), so any budget is dropped. The level cap is enforced as
+//   maxOutputTokens on the Go route only, where event.options.maxTokens is
+//   ignored (verified live: the route accepts the full 131072 cap).
+// - /chat/completions (Google's OpenAI-compatible surface, OpenRouter, Go's
+//   openai route): reasoning_effort, which those surfaces map to thinkingLevel.
+function applyGeminiLevel(body: any, level: EffortLevel, url: string): boolean {
+  const gemini = parseGeminiModel(typeof body?.model === "string" ? body.model : modelFromGooglePath(url));
+  if (!gemini) return false;
+
+  const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  const thinkingLevel = level === "medium" && !gemini.supportsMedium ? "high" : GEMINI_LEVEL_REQUEST[level];
+
+  if (/:(?:streamGenerateContent|generateContent)$/i.test(pathname)) {
+    const generationConfig = { ...(body.generationConfig ?? {}) };
+    const thinkingConfig: any = { ...(generationConfig.thinkingConfig ?? {}) };
+    delete thinkingConfig.thinkingBudget;
+    generationConfig.thinkingConfig = { ...thinkingConfig, thinkingLevel };
+    if (OPENCODE_GO_URL.test(url)) generationConfig.maxOutputTokens = LEVEL_REQUEST[level].maxTokens;
+    body.generationConfig = generationConfig;
+    return true;
+  }
+
+  if (/\/chat\/completions$/i.test(pathname)) {
+    body.reasoning_effort = thinkingLevel;
+    return true;
+  }
+
+  return false;
+}
+
 // Effort dialect detection is per request, from the model actually being requested.
 // The http.request hook event carries the provider's own model reference
 // (event.model), even when a gateway like OpenCode Go proxies many models
@@ -332,6 +403,9 @@ function detectBackend(model: { providerID?: string; id?: string } | undefined, 
   // MiMo keeps the local server's own controls (reasoning_effort,
   // chat_template_kwargs) instead of the remote MiMo dialect.
   if (parseMimoModel(modelId) && !isLocalHost(url)) return "mimo";
+  // Google Gemini models from Gemini 3 onwards through a remote API (the model
+  // may live in the /models/{model}: URL path instead of the request body).
+  if (parseGeminiModel(modelId || modelFromGooglePath(url)) && !isLocalHost(url)) return "gemini";
   // Local inference servers (llama.cpp, Ollama) on loopback or LAN hosts.
   if (isLocalHost(url)) return "local";
   return null;
@@ -345,7 +419,7 @@ const CONFIDENCE_TOOL = "systemone_check_confidence";
 // Effort dialect a primary request may speak, decided per request from the model
 // being requested. "local": a local inference server (llama.cpp or Ollama) on a
 // loopback or LAN host.
-type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "local";
+type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "local";
 
 interface SystemOneConfig {
   baseURL: string;
@@ -667,6 +741,8 @@ export default Plugin.define({
           if (!applyZaiLevel(body, level, event.request.url)) return;
         } else if (dialect === "mimo") {
           if (!applyMimoLevel(body, level, event.request.url)) return;
+        } else if (dialect === "gemini") {
+          if (!applyGeminiLevel(body, level, event.request.url)) return;
         } else {
           // Local inference server, its kind probed once per origin.
           // Ollama and llama.cpp both take top-level reasoning_effort on
