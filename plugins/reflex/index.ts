@@ -299,6 +299,120 @@ function applyGeminiLevel(body: any, level: EffortLevel, url: string): boolean {
   return false;
 }
 
+// Xiaomi MiMo and Google Gemini are matched by version; Qwen additionally
+// matches versionless product ids (qwen-plus, qwen-max...) because Alibaba
+// keeps those as live hybrid-thinking aliases.
+
+// Qwen levels per complexity level. Qwen's native knob is a boolean
+// (enable_thinking / thinking.type) to turn thought on or off, plus an
+// intensity: reasoning_effort on Chat Completions/DashScope (low/medium/xhigh
+// on Qwen3.8; low/medium/high on Qwen3.5-3.7), reasoning.effort on the
+// Responses surface (supports xhigh there), and output_config.effort (Claude
+// style) on the Anthropic-compatible surface. "high" is mapped to "xhigh" where
+// Qwen's top tier is xhigh. Simple turns thinking off entirely
+// (enable_thinking=false / thinking.type=disabled). thinking_budget and
+// thinking.budget_tokens are never sent: they conflict with or are rejected
+// alongside the effort knobs.
+const QWEN_LEVEL_REQUEST = {
+  simple: { thinking: false, effort: "low" },
+  medium: { thinking: true, effort: "medium" },
+  high: { thinking: true, effort: "high" },
+} as const;
+
+// Matches "qwen3.8-max", "qwen3.7-plus", "qwen3.6-flash", "qwen3.5-plus",
+// "qwen3.8-omni-flash", "qwen3-coder-plus", "qwen/qwen3.7-max" (OpenRouter
+// prefix), and the versionless flagship aliases "qwen-plus", "qwen-max",
+// "qwen-turbo", "qwen-flash". Gate at Qwen3.5+ or a versionless flagship alias.
+// Qwen3-Coder, Qwen3-VL, Qwen3.5-Omni (self-contradictory thinking support) and
+// qwen1.5/2.x have no safe thinking knob and are excluded. "thinkingOnly" marks
+// the few models that always think and cannot disable it (their simple level
+// falls back to the lowest effort instead of off); "xhigh" marks models whose top
+// effort tier is xhigh rather than high (Qwen3.8+).
+function parseQwenModel(model: unknown): { thinkingOnly: boolean; xhigh: boolean } | null {
+  if (typeof model !== "string") return null;
+  const id = model.toLowerCase().split("/").pop() ?? "";
+  if (!id.startsWith("qwen")) return null;
+
+  // Versionless flagship aliases (no digit right after "qwen").
+  if (!/^qwen\d/.test(id)) {
+    if (/^(qwen)-(plus|max|turbo|flash)(-|$)/.test(id)) return { thinkingOnly: false, xhigh: false };
+    return null;
+  }
+
+  // A version digit follows. Reject Qwen3-Coder / Qwen3-VL / audio / math and
+  // the Qwen3.5-Omni speech family (its thinking support is self-contradictory
+  // across Alibaba's pages, so it is left untouched rather than risk a foreign field).
+  if (/^qwen3-(coder|vl|audio|math)/.test(id)) return null;
+  if (/^qwen3\.5-omni/.test(id)) return null;
+  const match = id.match(/^qwen(\d+)(?:[._-](\d+))?/);
+  if (!match) return null;
+  const major = parseInt(match[1], 10);
+  const minor = match[2] ? parseInt(match[2], 10) : 0;
+
+  if (major < 3) return null;
+  if (major === 3 && minor === 0 && /-(coder|vl|omni|audio|math)/.test(id)) return null;
+  if (major === 3 && minor < 5 && !/-(plus|max|turbo|flash)/.test(id)) return null;
+
+  // Qwen3.8's top effort tier is "xhigh" (not "high"); 3.5-3.7 use "high".
+  const xhigh = major > 3 || (major === 3 && minor >= 8);
+  // Thinking-only models cannot disable thinking.
+  const thinkingOnly = /^qwen3\.8-2\.4t/.test(id) || /-preview$/.test(id) || /^qwen3\.7-max-2026-05-17/.test(id);
+  return { thinkingOnly, xhigh };
+}
+
+// Applies the session's level to a Qwen request body (in place). Returns false
+// when the request must stay untouched (not a Qwen model, or an endpoint shape
+// Qwen does not serve). The field dialect is chosen per surface:
+// - /chat/completions (OpenAI-compatible, DashScope, OpenRouter, Go): the
+//   boolean enable_thinking to turn thought on/off, plus reasoning_effort as
+//   the intensity. Simple sets enable_thinking=false (and drops any effort or
+//   budget so no conflicting knob survives).
+// - /responses (OpenAI-compatible Responses): reasoning.effort, the documented
+//   knob there. Simple maps to "none" when the model supports off, else "low".
+// - /messages (Anthropic-compatible): thinking.type to turn thought on/off, with
+//   output_config.effort (Claude-style) as the intensity. thinking.budget_tokens
+//   is deliberately NOT sent — the Go anthropic route and Claude-style surfaces
+//   reject it, while output_config.effort is the portable intensity knob. Simple
+//   sets type=disabled (dropping any budget). Verified live through Go.
+function applyQwenLevel(body: any, level: EffortLevel, url: string): boolean {
+  const qwen = parseQwenModel(body?.model);
+  if (!qwen) return false;
+
+  const request = QWEN_LEVEL_REQUEST[level];
+  const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  const on = level !== "simple" || qwen.thinkingOnly;
+  const effort = level === "high" && qwen.xhigh ? "xhigh" : request.effort;
+
+  if (/\/responses$/i.test(pathname)) {
+    body.reasoning = { effort: on ? effort : qwen.thinkingOnly ? "low" : "none" };
+    return true;
+  }
+
+  if (/\/chat\/completions$/i.test(pathname)) {
+    delete body.thinking_budget;
+    delete body.reasoning;
+    if (!on) {
+      delete body.reasoning_effort;
+      body.enable_thinking = false;
+    } else {
+      body.enable_thinking = true;
+      body.reasoning_effort = effort;
+    }
+    return true;
+  }
+
+  if (isAnthropicMessagesEndpoint(url)) {
+    const thinking: any = { ...(body.thinking ?? {}) };
+    delete thinking.budget_tokens;
+    thinking.type = on ? "enabled" : "disabled";
+    body.thinking = thinking;
+    if (on) body.output_config = { ...(body.output_config ?? {}), effort };
+    return true;
+  }
+
+  return false;
+}
+
 // Effort dialect detection is per request, from the model actually being requested.
 // The http.request hook event carries the provider's own model reference
 // (event.model), even when a gateway like OpenCode Go proxies many models
@@ -406,6 +520,10 @@ function detectBackend(model: { providerID?: string; id?: string } | undefined, 
   // Google Gemini models from Gemini 3 onwards through a remote API (the model
   // may live in the /models/{model}: URL path instead of the request body).
   if (parseGeminiModel(modelId || modelFromGooglePath(url)) && !isLocalHost(url)) return "gemini";
+  // Qwen models from Qwen3.5 onwards, plus the versionless flagship aliases
+  // (qwen-plus, qwen-max...), through a remote API. A locally served Qwen keeps
+  // the local server's own controls.
+  if (parseQwenModel(modelId) && !isLocalHost(url)) return "qwen";
   // Local inference servers (llama.cpp, Ollama) on loopback or LAN hosts.
   if (isLocalHost(url)) return "local";
   return null;
@@ -419,7 +537,7 @@ const CONFIDENCE_TOOL = "systemone_check_confidence";
 // Effort dialect a primary request may speak, decided per request from the model
 // being requested. "local": a local inference server (llama.cpp or Ollama) on a
 // loopback or LAN host.
-type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "local";
+type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "gemini" | "qwen" | "local";
 
 interface SystemOneConfig {
   baseURL: string;
@@ -743,6 +861,8 @@ export default Plugin.define({
           if (!applyMimoLevel(body, level, event.request.url)) return;
         } else if (dialect === "gemini") {
           if (!applyGeminiLevel(body, level, event.request.url)) return;
+        } else if (dialect === "qwen") {
+          if (!applyQwenLevel(body, level, event.request.url)) return;
         } else {
           // Local inference server, its kind probed once per origin.
           // Ollama and llama.cpp both take top-level reasoning_effort on

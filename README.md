@@ -11,7 +11,7 @@ Plugin for coding agent workflow optimization and safeguarding using any system 
 - TypeSafe Jev and other System One decision models as the classifier, through the TypeSafe API directly, OpenRouter, the Vercel AI Gateway or OpenCode Zen
 - Use with OpenCode v2 agent
 - Decision-driven history compaction
-- Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp, Ollama, OpenAI GPT reasoning models, Z.ai GLM models (GLM-5.2 onwards), Xiaomi MiMo models (MiMo-V2.5 onwards) and Google Gemini models (Gemini 3 onwards) in accordance. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin
+- Dynamic thinking effort level: qualifies each prompt as *low*, *medium* or *high* complexity, setting `maxTokens` alongside automatic effort changing for Anthropic, llama.cpp, Ollama, OpenAI GPT reasoning models, Z.ai GLM models (GLM-5.2 onwards), Xiaomi MiMo models (MiMo-V2.5 onwards), Google Gemini models (Gemini 3 onwards) and Qwen models (Qwen3.5 onwards and the qwen-plus/qwen-max aliases) in accordance. The request dialect is detected per request from the model actually being requested, so multimodel setups — including one gateway proxying many models — never send a foreign field; models without a wired dialect stay untouched and can still use other features of the plugin
 - Confidence level tool: automatically suggested for *medium* and *high* complexity tasks, allows the LLM to check for the confidence level of its current line of thinking before finalizing a response and correct itself in the way if needed
 - Up to two-step syntax checks after `edit` and `write` tool calls using parsers and decision model
 - Shell command check guardrail against commands that may cause damage to a repository or remove files without backup
@@ -33,5 +33,5 @@ For development, add a `"debugLog":` key to the plugin's options pointing to a f
 
 ## TO-DO
 - Add automatic effort changing capabilities for local models running through LM Studio (blocked upstream: its OpenAI-compatible endpoint documents no reasoning field yet)
-- Add automatic effort changing capabilities for Qwen and other providers
+- Add automatic effort changing capabilities for other providers beyond the wired dialects (Anthropic, GPT, GLM, MiMo, Gemini, Qwen)
 - Use with other agents like Claude Code, Hermes, Codex and Qwen Code

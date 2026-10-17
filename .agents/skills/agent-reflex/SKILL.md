@@ -38,7 +38,10 @@ git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
   `reasoning_effort`), GLM-5.2+ (`thinking.type` + `reasoning_effort`), Xiaomi
   MiMo V2.5+ (`thinking.type`, or `reasoning.effort` / `reasoning_effort` on
   the Responses API and gateway routes), Google Gemini 3+ (`thinkingLevel`, or
-  `reasoning_effort` on OpenAI-compatible routes), local llama.cpp/Ollama
+  `reasoning_effort` on OpenAI-compatible routes), Qwen 3.5+ / qwen-plus /
+  qwen-max (`enable_thinking` + `reasoning_effort` on Chat Completions,
+  `reasoning.effort` on Responses, `thinking.type` + `output_config.effort` on
+  the Anthropic surface), local llama.cpp/Ollama
   (`reasoning_effort`, plus `chat_template_kwargs` on llama.cpp). Dialects are
   detected per request, so multimodel setups never send a foreign field;
   models without a wired dialect stay untouched.
