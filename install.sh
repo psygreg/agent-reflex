@@ -23,6 +23,7 @@ CX_PLUGIN_SRC="$REPO_DIR/plugins/codex"
 HX_PLUGIN_SRC="$REPO_DIR/plugins/hermes"
 QX_PLUGIN_SRC="$REPO_DIR/plugins/qwen-code"
 AX_PLUGIN_SRC="$REPO_DIR/plugins/antigravity"
+PX_PLUGIN_SRC="$REPO_DIR/plugins/pi"
 SKILL_SRC="$REPO_DIR/.agents/skills/agent-reflex"
 
 # The global OpenCode config lives in ~/.config/opencode (XDG) or, with some
@@ -177,6 +178,8 @@ install_agent_port() {
     cp "$cfg" "$keep"
   fi
   cp -R "$src"/. "$dest"/
+  # Keep test harnesses out of the install dir (harmless, but not part of the plugin).
+  rm -f "$dest"/test.ts "$dest"/test.js 2>/dev/null || true
   if [ -n "$keep" ]; then
     cp "$keep" "$cfg"
     rm -f "$keep"
@@ -250,6 +253,9 @@ install_agent_ports() {
   # Antigravity: copy into the global plugin dir (discovered by directory, no
   # install command and no enable gate — like Hermes but without plugins.enabled).
   install_agent_port "$AX_PLUGIN_SRC" "$HOME/.gemini/config/plugins/agent-reflex" "Antigravity"
+  # Pi: copy into the extensions dir (auto-discovered by index.ts at the extension
+  # root, no install command and no enable gate). Pi loads it via its jiti TS loader.
+  install_agent_port "$PX_PLUGIN_SRC" "$HOME/.pi/agent/extensions/agent-reflex" "Pi"
 }
 
 # Adds "agent-reflex" to plugins.enabled in ~/.hermes/config.yaml (creating the

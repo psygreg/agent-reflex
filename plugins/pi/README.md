@@ -1,0 +1,99 @@
+# agent-reflex for Pi
+
+Pi port of the `agent-reflex` OpenCode plugin: a small System One decision model
+runs alongside the agent to safeguard shell commands, double-check edits, tune
+effort per task, prune history, and let the model sanity-check its own reasoning.
+
+Pi is the most extensible agent this plugin ports to, and the **only one** where
+the two OpenCode-only features on every other port actually work: dynamic effort
+and custom history pruning. Install it into `~/.pi/agent/extensions/agent-reflex/`
+(the installer does this), and create `agent-reflex.jsonc` in the plugin root with
+your classifier settings.
+
+## What it does
+
+- **Dynamic thinking effort** (`before_agent_start`): classifies each prompt
+  *simple*/*medium*/*high* and sets Pi's native thinking level
+  (`off`/`low`/`high`) with `pi.setThinkingLevel()`. Pi translates the unified
+  level to each model's native wire field via its own `thinkingLevelMap`, so this
+  replaces the OpenCode plugin's hand-rolled per-vendor dialects (GLM, MiMo,
+  Gemini, Qwen, Kimi…). This is the plugin's headline feature and it works at full
+  fidelity here.
+- **Custom history pruning** (`context`, opt-in): when the history grows long,
+  scores each old message with the classifier and drops the redundant ones,
+  preserving structural (tool call/result) messages and the recent tail. The
+  `context` event receives a deep copy of the message list and can return a
+  rewritten one — the one capability no other non-OpenCode agent exposes.
+- **Shell guardrail** (`tool_call`): scores a command for damage potential and
+  blocks it (`{ block: true }`) before it runs. A real block, like Claude
+  Code/Codex/Qwen Code/Antigravity.
+- **Post-edit double-check** (`tool_result`): runs a language parser on the edited
+  file and, on medium/high complexity, a System One bug check on the edited text.
+  Findings are appended to the tool result so the agent can fix problems.
+- **Complexity classification** (`before_agent_start`): also injects a note
+  suggesting a confidence check on medium/high.
+- **Confidence check** (`confidence_check` tool and `/confidence` command): scores
+  the model's current line of thought and returns CONTINUE or RESTART.
+
+## Configuration
+
+Create `agent-reflex.jsonc` in the plugin root. Option names match the OpenCode
+plugin:
+
+```jsonc
+{
+  "provider": "llamacpp",          // llamacpp | ollama | lmstudio | typesafe | openrouter | vercel | opencode | custom
+  "baseURL": "http://127.0.0.1:8080/v1",  // optional; overrides the preset
+  "model": "liquid-d1",            // REQUIRED classifier model
+  "apiKey": "{env:MY_API_KEY}",    // optional; {env:NAME} is resolved
+  "fallbackModel": "jev-1.13",     // optional; retried when the primary rejects
+  "debugLog": "/tmp/agent-reflex.log"  // optional
+}
+```
+
+When `model` or `baseURL` is missing, the hooks that need the classifier fail
+open: the shell command runs, the edit passes, effort is left alone, and the
+confidence check reports the classifier is unavailable.
+
+## Feature flags
+
+Two features carry real cost or override provider defaults, so they are opt-in:
+
+| Flag | Effect |
+|---|---|
+| `AGENT_REFLEX_PRUNE=1` | Enable history pruning (`context`). Makes one classifier call per old message before every model request — real latency and token cost. Off by default. |
+| `AGENT_REFLEX_MAXTOKENS=1` | Set the request token cap per level (`before_provider_request`), matching the plugin's `maxTokens` (simple 8192, medium 65536, high 131072). Overrides the provider's own cap. Off by default. |
+
+The effort tuning, guardrail, post-edit check, and confidence check are always on.
+
+## Level mapping
+
+Complexity maps to Pi's thinking level as `simple→off`, `medium→low`,
+`high→high` — the "simple disables thinking" convention used for the MiMo and
+Qwen ports. Pi clamps the level to the active model's `thinkingLevelMap`, so a
+model that cannot reach `off` (some reasoning models are always on) falls to its
+nearest supported level rather than erroring.
+
+## Pi-only notes
+
+- **Effort and pruning are fully portable here** — the two features every other
+  non-OpenCode port documents as impossible. Pi's `setThinkingLevel()` and the
+  `context` event's `{ messages }` return make them native.
+- **Per-model effort dialects are delegated to Pi.** The OpenCode plugin maintains
+  hand-rolled rewrites (`applyZaiLevel`, `applyMimoLevel`, `applyGeminiLevel`, …);
+  on Pi that layer is `thinkingLevelMap`, which Pi already keeps per-model correct.
+- **Pruning cost.** The `context` handler scores each old message with the
+  classifier before every model request. That is faithful to the OpenCode plugin
+  but can be slow on long histories — hence the `AGENT_REFLEX_PRUNE=1` gate. A
+  future improvement is to batch or cache scores.
+- Extensions run in-process with full permissions (like Hermes), so there is no
+  sandbox boundary beyond what you add.
+
+## Layout
+
+```
+index.ts         the extension factory (registers events, the tool, the command)
+classifier.ts    config loader (agent-reflex.jsonc) + System One client
+check.ts         language parsers + edit excerpt (post-edit check)
+test.ts          behavior tests (not installed)
+```
