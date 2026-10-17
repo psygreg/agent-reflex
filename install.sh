@@ -2,13 +2,15 @@
 # agent-reflex installer.
 #
 # First run: interactively walks through the classifier (System One) options,
-# copies the plugin into OpenCode's config directory, installs the repo's
-# agent skill (agent-reflex) when it is not installed yet, adds the plugin
-# entry to the OpenCode config, and installs the Claude Code port
-# (plugins/claude-code) when the Claude Code CLI is present. Re-running only
-# updates the plugin files: an existing installation (plugin copy or config
-# entry) is detected, the configured options and an already-installed skill are
-# left untouched, and a missing skill is still installed.
+# then installs each piece only for the software actually present on PATH. The
+# OpenCode plugin (and its config entry) is installed when the opencode CLI is
+# present, the repo's agent skill (agent-reflex) when it is not installed yet,
+# and each agent port (Claude Code, Codex, Hermes, Qwen Code, Antigravity, Pi,
+# MiMo Code) only when that agent's CLI is present — anything absent is skipped
+# entirely. Re-running only updates the plugin files: an existing installation
+# (plugin copy or config entry) is detected, the configured options and an
+# already-installed skill are left untouched, and a missing skill is still
+# installed.
 #
 # Requires bash and, for the automatic config merge, bun, node (bundled with
 # npm) or deno — the plugin needs a JS/TS runtime to load anyway. Without any
@@ -71,6 +73,18 @@ fi
 msg() { echo "${BOLD}${CYAN}[agent-reflex]${RESET}: $*"; }
 warn() { echo "${BOLD}${YELLOW}[agent-reflex]${RESET}: ${BOLD}$*${RESET}"; }
 err() { echo "${BOLD}${RED}[agent-reflex]${RESET}: $*" >&2; }
+
+# True when at least one of the given CLI binaries is on PATH. Agent ports are
+# installed only for agents that are actually present, so a machine running just
+# one agent does not collect plugin files and classifier configs for the others.
+# Aliases are accepted (e.g. Antigravity: antigravity/gemini; MiMo Code: mimocode/mimo).
+have_cli() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
 die() { err "${RED}$*${RESET}"; exit 1; }
 
 # Classifier presets: default base URL and suggested model per provider.
@@ -114,12 +128,6 @@ update_files() {
 # already manages (~/.agents/skills, ~/.claude/skills) or a pre-existing
 # OpenCode copy are detected and left untouched; the skill itself carries a
 # repo-clone fallback for running outside the repository.
-skill_installed() {
-  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/agent-reflex/SKILL.md" ] && return 0
-  [ -f "$HOME/.agents/skills/agent-reflex/SKILL.md" ] && return 0
-  [ -f "$HOME/.claude/skills/agent-reflex/SKILL.md" ] && return 0
-  return 1
-}
 
 # Runtime for the skills CLI: bunx (bun) or npx (node, bundled with npm).
 SKILLS_CLI=""
@@ -131,10 +139,6 @@ fi
 
 install_skill() {
   if [ ! -f "$SKILL_SRC/SKILL.md" ]; then
-    return
-  fi
-  if skill_installed; then
-    msg "Skill agent-reflex already installed — left untouched."
     return
   fi
   if [ -z "$SKILLS_CLI" ]; then
@@ -239,25 +243,41 @@ PY
 }
 
 install_agent_ports() {
+  # Each port is installed only when that agent's CLI is present; a missing agent
+  # is skipped with no output (no files copied, no config written).
   # Claude Code: register via `claude plugin install <dir>`.
-  install_agent_port "$CC_PLUGIN_SRC" "$HOME/.claude/plugins/agent-reflex" "Claude Code" claude plugin install
+  if have_cli claude; then
+    install_agent_port "$CC_PLUGIN_SRC" "$HOME/.claude/plugins/agent-reflex" "Claude Code" claude plugin install
+  fi
   # Codex: register via `codex plugin install <dir>`.
-  install_agent_port "$CX_PLUGIN_SRC" "$HOME/.codex/plugins/agent-reflex" "Codex" codex plugin install
+  if have_cli codex; then
+    install_agent_port "$CX_PLUGIN_SRC" "$HOME/.codex/plugins/agent-reflex" "Codex" codex plugin install
+  fi
   # Hermes: copy the plugin, then enable it in config.yaml (Hermes has no
   # install command — plugins are discovered by directory but disabled by
   # default until listed under plugins.enabled).
-  install_agent_port "$HX_PLUGIN_SRC" "$HOME/.hermes/plugins/agent-reflex" "Hermes"
-  enable_hermes_plugin
+  if have_cli hermes; then
+    install_agent_port "$HX_PLUGIN_SRC" "$HOME/.hermes/plugins/agent-reflex" "Hermes"
+    enable_hermes_plugin
+  fi
   # Qwen Code: copy the plugin files + config, then register via
   # `qwen extensions install <dir>` (Qwen loads extensions from ~/.qwen/extensions).
-  install_agent_port "$QX_PLUGIN_SRC" "$HOME/.qwen/extensions/agent-reflex" "Qwen Code" qwen extensions install
+  if have_cli qwen; then
+    install_agent_port "$QX_PLUGIN_SRC" "$HOME/.qwen/extensions/agent-reflex" "Qwen Code" qwen extensions install
+  fi
   # Antigravity: copy into the global plugin dir (discovered by directory, no
   # install command and no enable gate — like Hermes but without plugins.enabled).
-  install_agent_port "$AX_PLUGIN_SRC" "$HOME/.gemini/config/plugins/agent-reflex" "Antigravity"
+  if have_cli antigravity gemini; then
+    install_agent_port "$AX_PLUGIN_SRC" "$HOME/.gemini/config/plugins/agent-reflex" "Antigravity"
+  fi
   # Pi: copy into the extensions dir (auto-discovered by index.ts at the extension
   # root, no install command and no enable gate). Pi loads it via its jiti TS loader.
-  install_agent_port "$PX_PLUGIN_SRC" "$HOME/.pi/agent/extensions/agent-reflex" "Pi"
-  install_mimocode_port
+  if have_cli pi; then
+    install_agent_port "$PX_PLUGIN_SRC" "$HOME/.pi/agent/extensions/agent-reflex" "Pi"
+  fi
+  if have_cli mimocode mimo; then
+    install_mimocode_port
+  fi
 }
 
 # MiMo Code is file-hook based: it loads hooks/*.ts and tools/*.ts from its config
@@ -356,11 +376,15 @@ enable_hermes_plugin() {
 # UPDATE MODE: an existing installation is only brought up to date.
 # ---------------------------------------------------------------
 if [ -f "$PLUGIN_DEST/index.ts" ] || { [ -n "$CONFIG_FILE" ] && grep -q 'plugins/reflex' "$CONFIG_FILE"; }; then
-  update_files
+  if have_cli opencode; then
+    update_files
+  fi
   install_skill
   install_agent_ports
   msg "Existing installation detected — options left untouched."
-  msg "Restart OpenCode ${BOLD}(opencode service restart)${RESET} to reload the plugin."
+  if have_cli opencode; then
+    msg "Restart OpenCode ${BOLD}(opencode service restart)${RESET} to reload the plugin."
+  fi
   exit 0
 fi
 
@@ -370,6 +394,17 @@ fi
   if [ ! -d "$PLUGIN_SRC" ]; then
     die "plugins/opencode not found next to install.sh — run from the repository root."
   fi
+
+# The classifier options below configure OpenCode's plugin and each agent port's
+# shared config. When none of that software is installed there is nothing to
+# configure and nothing to copy, so stop before prompting instead of collecting
+# answers that would be discarded.
+if ! have_cli opencode claude codex hermes qwen antigravity gemini pi mimocode mimo; then
+  echo
+  warn "No supported agent CLI found on PATH (opencode, claude, codex, hermes,"
+  warn "qwen, antigravity/gemini, pi, mimocode/mimo) — nothing to install."
+  exit 0
+fi
 
 # Prompt helper: reads one line, applies DEFAULT when the line is empty, and
 # exits cleanly when stdin closes (EOF) instead of looping or aborting.
@@ -458,7 +493,11 @@ ask debugLog "${BOLD}Debug log file for outgoing request bodies${RESET} ${DIM}(o
 # ---------------------------------------------------------------
 # Install the plugin files, the skill, and merge the config entry.
 # ---------------------------------------------------------------
-update_files
+# OpenCode's own plugin is only written when the opencode CLI is present; the
+# skill and the detected agent ports are installed regardless.
+if have_cli opencode; then
+  update_files
+fi
 install_skill
 
 # Agent ports: register each plugin and write its shared classifier config. The
@@ -589,23 +628,38 @@ manual_entry() {
 }
 
 merged=0
-if [ -n "$JS_RUNTIME" ]; then
-  if [ -z "$CONFIG_FILE" ]; then
-    CONFIG_FILE="$CONFIG_DIR/opencode.json"
+if have_cli opencode; then
+  if [ -n "$JS_RUNTIME" ]; then
+    if [ -z "$CONFIG_FILE" ]; then
+      CONFIG_FILE="$CONFIG_DIR/opencode.json"
+    fi
+    if CONFIG_FILE="$CONFIG_FILE" make_entry; then
+      merged=1
+    fi
+  else
+    echo
+    warn "No JS runtime found (bun, node or deno) — plugin files are installed,"
+    echo "but the config entry could not be merged automatically."
   fi
-  if CONFIG_FILE="$CONFIG_FILE" make_entry; then
-    merged=1
-  fi
-else
-  echo
-  warn "No JS runtime found (bun, node or deno) — plugin files are installed,"
-  echo "but the config entry could not be merged automatically."
-fi
 
-if [ "$merged" = 1 ]; then
-  echo
-  msg "${BOLD}${GREEN}Installed.${RESET} Restart OpenCode ${BOLD}(opencode service restart)${RESET} to load the plugin."
-  msg "The Claude Code and Codex ports are under ${DIM}~/.claude/plugins/agent-reflex${RESET} and ${DIM}~/.codex/plugins/agent-reflex${RESET} — register them with their CLIs if not already enabled."
+  if [ "$merged" = 1 ]; then
+    echo
+    msg "${BOLD}${GREEN}Installed.${RESET} Restart OpenCode ${BOLD}(opencode service restart)${RESET} to load the plugin."
+    # Only mention the agent ports that were actually installed (their CLI is present).
+    if have_cli claude && have_cli codex; then
+      msg "The Claude Code and Codex ports are under ${DIM}~/.claude/plugins/agent-reflex${RESET} and ${DIM}~/.codex/plugins/agent-reflex${RESET} — register them with their CLIs if not already enabled."
+    elif have_cli claude; then
+      msg "The Claude Code port is under ${DIM}~/.claude/plugins/agent-reflex${RESET} — register it with the claude CLI if not already enabled."
+    elif have_cli codex; then
+      msg "The Codex port is under ${DIM}~/.codex/plugins/agent-reflex${RESET} — register it with the codex CLI if not already enabled."
+    fi
+  else
+    manual_entry
+  fi
 else
-  manual_entry
+  # No OpenCode on this machine: its plugin copy and config entry are skipped
+  # entirely (silent, like the other absent agents). The skill and any detected
+  # agent ports were still installed above.
+  echo
+  msg "${BOLD}${GREEN}Installed.${RESET}"
 fi
