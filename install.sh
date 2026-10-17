@@ -22,6 +22,7 @@ CC_PLUGIN_SRC="$REPO_DIR/plugins/claude-code"
 CX_PLUGIN_SRC="$REPO_DIR/plugins/codex"
 HX_PLUGIN_SRC="$REPO_DIR/plugins/hermes"
 QX_PLUGIN_SRC="$REPO_DIR/plugins/qwen-code"
+AX_PLUGIN_SRC="$REPO_DIR/plugins/antigravity"
 SKILL_SRC="$REPO_DIR/.agents/skills/agent-reflex"
 
 # The global OpenCode config lives in ~/.config/opencode (XDG) or, with some
@@ -246,6 +247,9 @@ install_agent_ports() {
   # Qwen Code: copy the plugin files + config, then register via
   # `qwen extensions install <dir>` (Qwen loads extensions from ~/.qwen/extensions).
   install_agent_port "$QX_PLUGIN_SRC" "$HOME/.qwen/extensions/agent-reflex" "Qwen Code" qwen extensions install
+  # Antigravity: copy into the global plugin dir (discovered by directory, no
+  # install command and no enable gate — like Hermes but without plugins.enabled).
+  install_agent_port "$AX_PLUGIN_SRC" "$HOME/.gemini/config/plugins/agent-reflex" "Antigravity"
 }
 
 # Adds "agent-reflex" to plugins.enabled in ~/.hermes/config.yaml (creating the

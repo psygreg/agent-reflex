@@ -49,7 +49,7 @@ ar_resolve_env() {
   local v="$1" name
   if [[ "$v" =~ ^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$ ]]; then
     name="${BASH_REMATCH[1]}"
-    echo "${!name}"
+    echo "${!name:-}"
   else
     echo "$v"
   fi

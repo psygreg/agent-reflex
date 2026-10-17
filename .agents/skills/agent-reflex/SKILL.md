@@ -8,7 +8,7 @@ description: Brief on the agent-reflex plugin's capabilities, and install or upd
 An OpenCode plugin that adds a small System One decision model (Jev, nimble, d1,
 liquid-d1...) as a classifier to the agent loop. This skill briefs the user on
 its capabilities and installs or updates it. The installer also installs the
-Claude Code, Codex, Hermes and Qwen Code ports when their CLIs are present.
+Claude Code, Codex, Hermes, Qwen Code and Antigravity ports when their CLIs are present.
 
 ## Locate the installer
 
@@ -61,18 +61,20 @@ TypeSafe API, OpenRouter, the Vercel AI Gateway or OpenCode Zen. A
 `fallbackModel` option retries the classifier when the primary model rejects
 requests (e.g. a free-model window closing).
 
-## Claude Code, Codex, Hermes and Qwen Code ports
+## Claude Code, Codex, Hermes, Qwen Code and Antigravity ports
 
 The same features run in Claude Code (`plugins/claude-code`), Codex
-(`plugins/codex`), Hermes (`plugins/hermes`) and Qwen Code (`plugins/qwen-code`)
-as plugins, which the installer sets up when each CLI is present. Two features are
-OpenCode-only because none of these agents' hooks can rewrite the model request:
-per-request dynamic effort/`maxTokens`, and custom history pruning. Additional
-per-agent caveats: Codex has no way to steer what compaction keeps (Claude Code
-and Qwen Code can, via `PreCompact` `custom_instructions`), so the Codex
-compaction hook is inert by default; Hermes hooks cannot block a tool call, so its
-guardrail is a `safe_run` command-execution wrapper rather than a hook, and it
-cannot prune history (only read it). The classifier config is shared
+(`plugins/codex`), Hermes (`plugins/hermes`), Qwen Code (`plugins/qwen-code`) and
+Antigravity (`plugins/antigravity`) as plugins, which the installer sets up when
+each CLI is present. Two features are OpenCode-only because none of these agents'
+hooks can rewrite the model request: per-request dynamic effort/`maxTokens`, and
+custom history pruning. Additional per-agent caveats: Codex has no way to steer
+what compaction keeps (Claude Code and Qwen Code can, via `PreCompact`
+`custom_instructions`), so the Codex compaction hook is inert by default; Hermes
+hooks cannot block a tool call, so its guardrail is a `safe_run` command-execution
+wrapper rather than a hook, and it cannot prune history (only read it); Antigravity
+delivers post-edit check findings one turn late (its `PostToolUse` cannot inject
+context) and has no compaction steering. The classifier config is shared
 (`agent-reflex.jsonc`, same option names), so the user answers the classifier
 questions once.
 
@@ -90,8 +92,9 @@ bash ../../../install.sh </dev/null
   or next to the config that references it); the configured options are left
   untouched. The Claude Code plugin files under `~/.claude/plugins/agent-reflex/`,
   the Codex plugin files under `~/.codex/plugins/agent-reflex/`, the Hermes
-  plugin files under `~/.hermes/plugins/agent-reflex/`, and the Qwen Code
-  extension files under `~/.qwen/extensions/agent-reflex/`
+  plugin files under `~/.hermes/plugins/agent-reflex/`, the Qwen Code
+  extension files under `~/.qwen/extensions/agent-reflex/`, and the Antigravity
+  plugin files under `~/.gemini/config/plugins/agent-reflex/`
   are refreshed too, and their `agent-reflex.jsonc` is left untouched.
 - If it instead prints the setup menu and ends with "No input available
   (stdin closed)", there is no installation yet — follow the fresh-install

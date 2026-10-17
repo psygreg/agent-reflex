@@ -1,0 +1,57 @@
+{
+  "agent-reflex-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "^run_command$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/guard.sh guard",
+            "timeout": 45
+          }
+        ]
+      }
+    ]
+  },
+  "agent-reflex-check": {
+    "PostToolUse": [
+      {
+        "matcher": "^(write_to_file|replace_file_content|multi_replace_file_content)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/check.sh check",
+            "timeout": 45
+          }
+        ]
+      }
+    ]
+  },
+  "agent-reflex-classify": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./scripts/classify.sh classify",
+        "timeout": 30
+      }
+    ]
+  },
+  "agent-reflex-feedback": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./scripts/check.sh deliver",
+        "timeout": 15
+      }
+    ]
+  },
+  "agent-reflex-compact": {
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "./scripts/compact.sh compact",
+        "timeout": 30
+      }
+    ]
+  }
+}
