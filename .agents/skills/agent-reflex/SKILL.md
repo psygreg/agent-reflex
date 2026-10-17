@@ -35,10 +35,12 @@ git clone https://github.com/psygreg/agent-reflex /tmp/agent-reflex
 - **Automatic effort control**: the level is written into every primary model
   request in the dialect the requested model actually speaks — Claude
   (`output_config.effort`), GPT reasoning models (`reasoning.effort` /
-  `reasoning_effort`), GLM-5.2+ (`thinking.type` + `reasoning_effort`), local
-  llama.cpp/Ollama (`reasoning_effort`, plus `chat_template_kwargs` on
-  llama.cpp). Dialects are detected per request, so multimodel setups never
-  send a foreign field; models without a wired dialect stay untouched.
+  `reasoning_effort`), GLM-5.2+ (`thinking.type` + `reasoning_effort`), Xiaomi
+  MiMo V2.5+ (`thinking.type`, or `reasoning.effort` / `reasoning_effort` on
+  the Responses API and gateway routes), local llama.cpp/Ollama
+  (`reasoning_effort`, plus `chat_template_kwargs` on llama.cpp). Dialects are
+  detected per request, so multimodel setups never send a foreign field;
+  models without a wired dialect stay untouched.
 - **Confidence tool**: the `systemone_check_confidence` tool scores the
   model's current line of thought and returns CONTINUE or RESTART.
 - **Shell guardrail**: shell commands are scored for damage potential;

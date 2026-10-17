@@ -143,6 +143,91 @@ function applyOpenAiLevel(body: any, level: EffortLevel, url: string): boolean {
   return false;
 }
 
+// Xiaomi MiMo request fields per complexity level (MiMo-V2.5 onwards).
+// thinking: the chain-of-thought toggle (thinking.type on /v1/chat/completions
+// and on the Anthropic-compatible /messages surface). On the Responses API
+// thinking is controlled through reasoning.effort: "none" disables it, while
+// "low", "medium" and "high" all enable thinking with identical behavior today
+// (Xiaomi does not yet differentiate their intensity), so the levels map one to
+// one for when it does. Only none/low/medium/high are ever sent: those are the
+// values MiMo's chat completions surface accepts (verified live through the
+// OpenCode Go gateway, which proxies MiMo on its openai-compatible route).
+const MIMO_LEVEL_REQUEST = {
+  simple: { thinking: false, effort: "none" },
+  medium: { thinking: true, effort: "medium" },
+  high: { thinking: true, effort: "high" },
+} as const;
+
+// Matches "mimo-v2.5", "MiMo-V2.6-Pro", "xiaomi/mimo-v2.5-pro",
+// "mimo-v2.6-pro-ultraspeed", "mimo2.6", "mimo-v2.6.1"... The negative
+// lookahead keeps size-suffixed legacy ids ("MiMo-7B-RL", "mimo-70b") from
+// matching. Only MiMo-V2.5 onwards is accepted: earlier versions
+// ("mimo-v2-flash") have no thinking controls, and future versions keep working.
+function parseMimoModel(model: unknown): boolean {
+  if (typeof model !== "string") return false;
+  const match = model.toLowerCase().match(/(?:^|[^a-z])mimo[-_.\s]?v?(\d+)(?:[-_.](\d+))?(?!\d|b(?![a-z]))/);
+  if (!match) return false;
+  const major = parseInt(match[1], 10);
+  const minor = match[2] ? parseInt(match[2], 10) : 0;
+  return major > 2 || (major === 2 && minor >= 5);
+}
+
+// OpenRouter speaks one unified reasoning parameter on every route and strips
+// provider-specific shapes such as MiMo's "thinking".
+function isOpenRouterUrl(url: string): boolean {
+  try {
+    return /(^|\.)openrouter\.ai$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// Applies the session's level to a Xiaomi MiMo request body (in place). Returns
+// false when the request must stay untouched (not a MiMo-V2.5+ model, or an
+// endpoint shape MiMo does not serve). The field dialect is chosen per surface:
+// - /responses (Xiaomi's OpenAI Responses surface): reasoning.effort, where
+//   "none" disables thinking. The reasoning object holds effort alone.
+// - /chat/completions on the OpenCode Go gateway: reasoning_effort plus
+//   max_completion_tokens, since the Go provider ignores event.options.maxTokens.
+//   Verified live: the route accepts none/low/medium/high ("minimal" is rejected)
+//   and the level caps fit its 131072-token completion limit.
+// - /chat/completions on OpenRouter: the unified reasoning.effort parameter
+//   (effort replaces the reasoning object; effort and max_tokens are mutually
+//   exclusive there).
+// - /chat/completions elsewhere (Xiaomi's own API and compatible endpoints) and
+//   the Anthropic-compatible /messages surface: the native thinking.type, whose
+//   object holds type alone (no budget is accepted).
+function applyMimoLevel(body: any, level: EffortLevel, url: string): boolean {
+  if (!parseMimoModel(body?.model)) return false;
+
+  const request = MIMO_LEVEL_REQUEST[level];
+  const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  const isChat = /\/chat\/completions$/i.test(pathname);
+
+  if (/\/responses$/i.test(pathname)) {
+    body.reasoning = { effort: request.effort };
+    return true;
+  }
+
+  if (isChat && OPENCODE_GO_URL.test(url)) {
+    body.reasoning_effort = request.effort;
+    body.max_completion_tokens = LEVEL_REQUEST[level].maxTokens;
+    return true;
+  }
+
+  if (isChat && isOpenRouterUrl(url)) {
+    body.reasoning = { effort: request.effort };
+    return true;
+  }
+
+  if (isChat || isAnthropicMessagesEndpoint(url)) {
+    body.thinking = { type: request.thinking ? "enabled" : "disabled" };
+    return true;
+  }
+
+  return false;
+}
+
 // Effort dialect detection is per request, from the model actually being requested.
 // The http.request hook event carries the provider's own model reference
 // (event.model), even when a gateway like OpenCode Go proxies many models
@@ -243,6 +328,10 @@ function detectBackend(model: { providerID?: string; id?: string } | undefined, 
   if (/claude/i.test(modelId)) return isAnthropicMessagesEndpoint(url) ? "anthropic" : null;
   // GPT reasoning models through the OpenAI API or OpenCode Go.
   if (OPENAI_REASONING_MODEL.test(modelId)) return "openai";
+  // Xiaomi MiMo models from v2.5 onwards through a remote API. A locally served
+  // MiMo keeps the local server's own controls (reasoning_effort,
+  // chat_template_kwargs) instead of the remote MiMo dialect.
+  if (parseMimoModel(modelId) && !isLocalHost(url)) return "mimo";
   // Local inference servers (llama.cpp, Ollama) on loopback or LAN hosts.
   if (isLocalHost(url)) return "local";
   return null;
@@ -256,7 +345,7 @@ const CONFIDENCE_TOOL = "systemone_check_confidence";
 // Effort dialect a primary request may speak, decided per request from the model
 // being requested. "local": a local inference server (llama.cpp or Ollama) on a
 // loopback or LAN host.
-type EffortDialect = "anthropic" | "openai" | "zai" | "local";
+type EffortDialect = "anthropic" | "openai" | "zai" | "mimo" | "local";
 
 interface SystemOneConfig {
   baseURL: string;
@@ -576,6 +665,8 @@ export default Plugin.define({
           if (!applyOpenAiLevel(body, level, event.request.url)) return;
         } else if (dialect === "zai") {
           if (!applyZaiLevel(body, level, event.request.url)) return;
+        } else if (dialect === "mimo") {
+          if (!applyMimoLevel(body, level, event.request.url)) return;
         } else {
           // Local inference server, its kind probed once per origin.
           // Ollama and llama.cpp both take top-level reasoning_effort on
