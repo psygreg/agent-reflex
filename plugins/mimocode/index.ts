@@ -66,6 +66,33 @@ function contentToText(content: any): string {
   }
 }
 
+// Tool-call pairing helpers: a provider request must keep an assistant message
+// with tool_calls together with its matching tool result(s). If compaction
+// keeps one half while folding the other into the digest, the API rejects the
+// request with "Cannot resolve tool name for tool_call_id=...".
+function toolCallLinkIds(msg: any): string[] {
+  const ids: string[] = [];
+  if (msg?.tool_call_id) ids.push(String(msg.tool_call_id));
+  for (const call of msg?.tool_calls ?? []) {
+    const id = call?.id ?? call?.tool_call_id;
+    if (id) ids.push(String(id));
+  }
+  const parts = Array.isArray(msg?.content) ? msg.content : [];
+  for (const p of parts) {
+    if (!["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type))) continue;
+    const id = p?.id ?? p?.tool_call_id ?? p?.toolCallId ?? p?.toolUseId;
+    if (id) ids.push(String(id));
+  }
+  return ids;
+}
+
+function isToolCallPairMember(msg: any): boolean {
+  if (msg?.role === "tool") return true;
+  if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) return true;
+  const parts = Array.isArray(msg?.content) ? msg.content : [];
+  return parts.some((p: any) => ["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type)));
+}
+
 function extractFilePath(input: any): string | undefined {
   if (!input || typeof input !== "object") return undefined;
   for (const key of ["file_path", "filePath", "path", "TargetFile", "targetFile", "file"]) {
@@ -148,6 +175,33 @@ export default {
     for (const r of ranked) {
       if (preservedIdx.size >= COMPACT_MAX_PRESERVED) break;
       if (r.s > COMPACT_RELEVANCE_KEEP) preservedIdx.add(r.i);
+    }
+    // Tool-call pairs are atomic: keeping a call without its result (or the
+    // reverse) makes the provider reject the whole request with
+    // "Cannot resolve tool name for tool_call_id=...". Force-preserve partners.
+    const allMsgs = [...distantPast, ...recentPast];
+    const idToIdx = new Map<string, number>();
+    for (let i = 0; i < allMsgs.length; i++) {
+      for (const id of toolCallLinkIds(allMsgs[i])) idToIdx.set(id, i);
+    }
+    for (let j = distantPast.length; j < allMsgs.length; j++) {
+      for (const id of toolCallLinkIds(allMsgs[j])) {
+        const i = idToIdx.get(id);
+        if (i !== undefined && i < distantPast.length) preservedIdx.add(i);
+      }
+    }
+    let grown = true;
+    while (grown) {
+      grown = false;
+      for (const i of [...preservedIdx]) {
+        for (const id of toolCallLinkIds(allMsgs[i])) {
+          const j = idToIdx.get(id);
+          if (j !== undefined && !preservedIdx.has(j)) {
+            preservedIdx.add(j);
+            grown = true;
+          }
+        }
+      }
     }
     const preservedMessages = scored.filter((_, i) => preservedIdx.has(i)).map((s) => s.msg);
     const dropped = scored.filter((_, i) => !preservedIdx.has(i));

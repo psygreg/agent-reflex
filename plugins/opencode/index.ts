@@ -1468,6 +1468,73 @@ function buildArgsFromSchema(schema: any, task: string, target: string): { args:
   return { args, missing, fallback: false };
 }
 
+// Tool-call pairing: a provider request must keep an assistant message with
+// tool_calls together with its matching tool result(s). If compaction keeps one
+// half while folding the other into the digest, the API rejects the request
+// with "Cannot resolve tool name for tool_call_id=...". These helpers identify
+// which tool-call ids a message participates in, so both halves can be treated
+// as atomic (either both survive verbatim or both fold into the digest).
+function toolCallLinkIds(msg: any): string[] {
+  const ids: string[] = [];
+  if (msg?.tool_call_id) ids.push(String(msg.tool_call_id));
+  for (const call of msg?.tool_calls ?? []) {
+    const id = call?.id ?? call?.tool_call_id;
+    if (id) ids.push(String(id));
+  }
+  const parts = Array.isArray(msg?.content) ? msg.content : [];
+  for (const p of parts) {
+    if (!["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type))) continue;
+    const id = p?.id ?? p?.tool_call_id ?? p?.toolCallId ?? p?.toolUseId;
+    if (id) ids.push(String(id));
+  }
+  return ids;
+}
+
+function isToolCallPairMember(msg: any): boolean {
+  if (msg?.role === "tool") return true;
+  if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) return true;
+  const parts = Array.isArray(msg?.content) ? msg.content : [];
+  return parts.some((p: any) => ["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type)));
+}
+
+// Expands a preserved-index set so no tool-call pair is ever split: every
+// preserved pair member drags in the messages sharing its tool-call ids, and
+// pair members whose partner already sits in the keep window are forced in too.
+// `pairMembers` must cover ALL messages (distant past + recent window).
+function closeToolCallPairs(
+  preservedIdx: Set<number>,
+  distantPast: any[],
+  recentPast: any[]
+): void {
+  const all = [...distantPast, ...recentPast];
+  const idToIdx = new Map<string, number>();
+  for (let i = 0; i < all.length; i++) {
+    for (const id of toolCallLinkIds(all[i])) idToIdx.set(id, i);
+  }
+  // Pairs cut by the keep-window boundary: the recent half is always sent, so
+  // the distant half must survive verbatim as well.
+  for (let j = distantPast.length; j < all.length; j++) {
+    for (const id of toolCallLinkIds(all[j])) {
+      const i = idToIdx.get(id);
+      if (i !== undefined && i < distantPast.length) preservedIdx.add(i);
+    }
+  }
+  // Fixpoint: a preserved call's result is preserved, and that result's call too.
+  let grown = true;
+  while (grown) {
+    grown = false;
+    for (const i of [...preservedIdx]) {
+      for (const id of toolCallLinkIds(all[i])) {
+        const j = idToIdx.get(id);
+        if (j !== undefined && !preservedIdx.has(j)) {
+          preservedIdx.add(j);
+          grown = true;
+        }
+      }
+    }
+  }
+}
+
 // Names of tools the model has already invoked in this session's transcript.
 // These are kept no matter what, so a task that has already reached for a tool
 // never loses it on a later turn of the same task.
@@ -1738,6 +1805,9 @@ export default Plugin.define({
           if (preservedIdx.size >= COMPACT_MAX_PRESERVED) break;
           if (r.s > COMPACT_RELEVANCE_KEEP) preservedIdx.add(r.i);
         }
+        // Tool-call pairs are atomic: keeping a call without its result (or the
+        // reverse) makes the provider reject the whole request.
+        closeToolCallPairs(preservedIdx, distantPast, recentPast);
         const preservedMessages = scored.filter((_, i) => preservedIdx.has(i)).map((s) => s.msg);
         const dropped = scored.filter((_, i) => !preservedIdx.has(i));
 
