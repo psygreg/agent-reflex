@@ -156,8 +156,12 @@ function applyZaiLevel(body: any, level: EffortLevel, url: string): boolean {
     delete body.thinking;
     body.reasoning_effort = zai.thinking || glm.forcedThinking ? zai.effort : "minimal";
     // The Go provider ignores event.options.maxTokens, so the level cap is enforced
-    // on the wire instead (the field OpenCode itself sends on this route).
-    body.max_completion_tokens = LEVEL_REQUEST[level].maxTokens;
+    // on the wire instead (the field OpenCode itself sends on this route). OpenCode's
+    // pre-filled cap is model-aware, so the level cap only ever lowers it.
+    const wanted = LEVEL_REQUEST[level].maxTokens;
+    const existing = body.max_completion_tokens ?? body.max_tokens;
+    body.max_completion_tokens =
+      typeof existing === "number" && existing > 0 ? Math.min(wanted, existing) : wanted;
     return true;
   }
 
@@ -1850,7 +1854,13 @@ export default Plugin.define({
       // tool on medium/high tasks.
       if (complexityScore !== null) {
         levelBySession.set(event.sessionID, level);
-        event.options.maxTokens = LEVEL_REQUEST[level].maxTokens;
+        // Clamp the level cap to opencode's pre-filled model-aware default
+        // (model catalog output limit, fitted to the room the prompt leaves),
+        // so a level cap never exceeds what the model can actually emit.
+        const wanted = LEVEL_REQUEST[level].maxTokens;
+        const cap = event.options.maxTokens;
+        event.options.maxTokens =
+          typeof cap === "number" && cap > 0 ? Math.min(wanted, cap) : wanted;
 
         if (level === "simple") {
           console.log(`[System One]: Simple task (${(complexityScore * 100).toFixed(0)}%). Optimizing for speed.`);

@@ -119,11 +119,15 @@ export default {
   // not exposed here), so "dynamic effort" on MiMo Code is token-cap only.
   "chat.params": async (input: any, output: any) => {
     const level = levelBySession.get(input?.sessionID ?? "") ?? "simple";
-    const cap = LEVEL_MAX_TOKENS[level];
-    if (!cap) return;
+    const wanted = LEVEL_MAX_TOKENS[level];
+    if (!wanted) return;
     try {
-      output.maxOutputTokens = cap;
-      arLog(`maxTokens set ${cap} for level=${level}`);
+      // Clamp to any pre-filled cap so the level cap never exceeds what the
+      // model can actually emit (when MiMo Code leaves it unset, use as-is).
+      const cap = output?.maxOutputTokens;
+      output.maxOutputTokens =
+        typeof cap === "number" && cap > 0 ? Math.min(wanted, cap) : wanted;
+      arLog(`maxTokens set ${output.maxOutputTokens} for level=${level}`);
     } catch (error: any) {
       arLog(`maxTokens rewrite failed: ${error?.message ?? error}`);
     }
