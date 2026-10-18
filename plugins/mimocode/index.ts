@@ -169,7 +169,12 @@ export default {
       compacted.push({
         role: "system",
         type: "text",
-        content: `Earlier context in this session, compacted (the messages below were folded into these facts):\n${digestLines.join("\n")}`,
+        content: [
+          {
+            type: "text",
+            text: `Earlier context in this session, compacted (the messages below were folded into these facts):\n${digestLines.join("\n")}`,
+          },
+        ],
       });
     }
 
