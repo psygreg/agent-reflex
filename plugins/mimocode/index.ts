@@ -80,7 +80,7 @@ function toolCallLinkIds(msg: any): string[] {
   const parts = Array.isArray(msg?.content) ? msg.content : [];
   for (const p of parts) {
     if (!["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type))) continue;
-    const id = p?.id ?? p?.tool_call_id ?? p?.toolCallId ?? p?.toolUseId;
+    const id = p?.id ?? p?.tool_call_id ?? p?.tool_use_id ?? p?.toolCallId ?? p?.toolUseId;
     if (id) ids.push(String(id));
   }
   return ids;
@@ -91,6 +91,15 @@ function isToolCallPairMember(msg: any): boolean {
   if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) return true;
   const parts = Array.isArray(msg?.content) ? msg.content : [];
   return parts.some((p: any) => ["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type)));
+}
+
+type ChatMsg = { role?: string; content?: unknown; tool_calls?: unknown };
+function toChatMsg(msg: any): ChatMsg {
+  const out: ChatMsg = {};
+  if (msg?.role !== undefined) out.role = msg.role;
+  if (msg?.content !== undefined) out.content = msg.content;
+  if (msg?.tool_calls !== undefined) out.tool_calls = msg.tool_calls;
+  return out;
 }
 
 function extractFilePath(input: any): string | undefined {
@@ -207,8 +216,49 @@ export default {
         }
       }
     }
-    const preservedMessages = scored.filter((_, i) => preservedIdx.has(i)).map((s) => s.msg);
-    const dropped = scored.filter((_, i) => !preservedIdx.has(i));
+    // Preserve far-past messages one-to-one ONLY when their original structural
+    // role is safe for the raw-history fallback: plain text, or a tool call whose
+    // result is preserved with it. Anything else becomes a line in the digest.
+    // This matters because a bare assistant `tool_calls` message works as a
+    // hidden request to the provider, but other styles (e.g. an assistant
+    // message with a `tool_use` content block and NO `tool_calls` field) do not:
+    // one provider silently drops them, leaving the paired `tool_result` as a
+    // dangling reference, and another rejects the whole request with
+    // "unexpected `tool_use_id` found in `tool_result` blocks" / "tool result's
+    // tool id not found (2013)". A message that *looks* like part of a call
+    // pair but has no recognizable call id gets no partner from
+    // `toolCallLinkIds`, so it must never be kept verbatim.
+    const preservedMessages: ChatMsg[] = [];
+    const dropped: { msg: any }[] = [];
+    for (const i of [...preservedIdx]) {
+      const msg = scored[i].msg;
+      let linkable = !isToolCallPairMember(msg);
+      if (!linkable) {
+        const ids = toolCallLinkIds(msg);
+        // Keep the pair only when BOTH halves are in the retained set and the
+        // result half is genuinely recognized (its content is a tool result).
+        linkable = ids.length > 0 && ids.every((id) => {
+          const j = idToIdx.get(id);
+          return j !== undefined && (preservedIdx.has(j) || j >= distantPast.length);
+        }) && ids.some((id) => {
+          const j = idToIdx.get(id);
+          return j !== undefined && isToolResultContent(allMsgs[j]?.content);
+        });
+      }
+      if (linkable) {
+        preservedMessages.push(toChatMsg(msg));
+        preservedIdx.delete(i);
+      } else {
+        dropped.push({ msg });
+      }
+    }
+    for (let i = 0; i < scored.length; i++) {
+      if (preservedIdx.has(i)) {
+        preservedMessages.push(toChatMsg(scored[i].msg));
+      } else if (!dropped.some((d) => d.msg === scored[i].msg)) {
+        dropped.push(scored[i]);
+      }
+    }
 
     // Structured digest of everything that did not survive verbatim.
     const tailText = dropped

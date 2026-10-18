@@ -508,6 +508,27 @@ export default function (pi: any) {
   // bounded set of high-relevance older messages verbatim, and folds the remaining
   // older messages into one structured digest so their detail is compressed rather
   // than discarded.
+  //
+  // Local copy of the shared pair-closing helper (see plugins/opencode/
+  // index.ts, and plugins/mimocode/index.ts, which cannot import helpers):
+  // tool-call pairs are atomic, so pruning must never leave an unpaired
+  // tool_use / tool_result.
+  function closeToolCallPairs(preservedIdx: Set<number>, distant: any[], recent: any[]): void {
+    const pairMembers = [...distant, ...recent];
+    for (let round = 0; round < 32; round++) {
+      const before = preservedIdx.size;
+      for (const i of [...preservedIdx]) {
+        const j = findPairMemberIndex(pairMembers[i], pairMembers, i);
+        if (j !== undefined && j < distant.length) preservedIdx.add(j);
+      }
+      for (const i of distant.keys()) {
+        if (!preservedIdx.has(i)) continue;
+        const j = findPairMemberIndex(pairMembers[i], pairMembers, i);
+        if (j !== undefined && j >= distant.length) preservedIdx.add(i);
+      }
+      if (preservedIdx.size === before) break;
+    }
+  }
   pi.on("context", async (event: any, _ctx: any) => {
     if (!COMPACT_ENABLED) return undefined;
     const messages: any[] = Array.isArray(event?.messages) ? event.messages : [];
@@ -547,6 +568,12 @@ export default function (pi: any) {
       if (preservedIdx.size >= COMPACT_MAX_PRESERVED) break;
       if (r.s > COMPACT_RELEVANCE_KEEP) preservedIdx.add(r.i);
     }
+    // Tool-call pairs are atomic: keeping a call without its result (or the
+    // reverse) leaves an unpaired tool_use / tool_result that the API rejects.
+    // Each preserved pair member drags its partner in, and pairs cut by the
+    // keep-window boundary keep the distant half too (the recent half is
+    // always sent). `pairMembers` must cover distant past + recent window.
+    closeToolCallPairs(preservedIdx, distantPast, recentPast);
     const preservedMessages = scored.filter((_, i) => preservedIdx.has(i)).map((s) => s.msg);
     const dropped = scored.filter((_, i) => !preservedIdx.has(i));
 

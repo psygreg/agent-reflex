@@ -1488,7 +1488,7 @@ function toolCallLinkIds(msg: any): string[] {
   const parts = Array.isArray(msg?.content) ? msg.content : [];
   for (const p of parts) {
     if (!["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type))) continue;
-    const id = p?.id ?? p?.tool_call_id ?? p?.toolCallId ?? p?.toolUseId;
+    const id = p?.id ?? p?.tool_call_id ?? p?.tool_use_id ?? p?.toolCallId ?? p?.toolUseId;
     if (id) ids.push(String(id));
   }
   return ids;
@@ -1511,16 +1511,25 @@ function closeToolCallPairs(
   recentPast: any[]
 ): void {
   const all = [...distantPast, ...recentPast];
-  const idToIdx = new Map<string, number>();
+  // A call and its result share one tool-call id, so an id maps to EVERY message
+  // that carries it (both halves), not just the last one. Keeping only the last
+  // index would hide the distant half of a pair whose result sits in the recent
+  // window, dropping the call while sending its result -> orphaned result.
+  const idToIdx = new Map<string, number[]>();
   for (let i = 0; i < all.length; i++) {
-    for (const id of toolCallLinkIds(all[i])) idToIdx.set(id, i);
+    for (const id of toolCallLinkIds(all[i])) {
+      const list = idToIdx.get(id);
+      if (list) list.push(i);
+      else idToIdx.set(id, [i]);
+    }
   }
   // Pairs cut by the keep-window boundary: the recent half is always sent, so
   // the distant half must survive verbatim as well.
   for (let j = distantPast.length; j < all.length; j++) {
     for (const id of toolCallLinkIds(all[j])) {
-      const i = idToIdx.get(id);
-      if (i !== undefined && i < distantPast.length) preservedIdx.add(i);
+      for (const i of idToIdx.get(id) ?? []) {
+        if (i < distantPast.length) preservedIdx.add(i);
+      }
     }
   }
   // Fixpoint: a preserved call's result is preserved, and that result's call too.
@@ -1529,14 +1538,140 @@ function closeToolCallPairs(
     grown = false;
     for (const i of [...preservedIdx]) {
       for (const id of toolCallLinkIds(all[i])) {
-        const j = idToIdx.get(id);
-        if (j !== undefined && !preservedIdx.has(j)) {
-          preservedIdx.add(j);
-          grown = true;
+        for (const j of idToIdx.get(id) ?? []) {
+          if (!preservedIdx.has(j)) {
+            preservedIdx.add(j);
+            grown = true;
+          }
         }
       }
     }
   }
+}
+
+const CALL_PART_TYPES = ["tool_use", "tool-call"];
+const RESULT_PART_TYPES = ["tool_result", "tool-result"];
+const TOOL_PART_TYPES = new Set([...CALL_PART_TYPES, ...RESULT_PART_TYPES]);
+
+function partToolId(p: any): string | undefined {
+  const id = p?.id ?? p?.tool_call_id ?? p?.tool_use_id ?? p?.toolCallId ?? p?.toolUseId;
+  return id ? String(id) : undefined;
+}
+
+function callIdsOf(msg: any): Set<string> {
+  const ids = new Set<string>();
+  for (const call of msg?.tool_calls ?? []) {
+    const id = call?.id ?? call?.tool_call_id;
+    if (id) ids.add(String(id));
+  }
+  for (const p of Array.isArray(msg?.content) ? msg.content : []) {
+    if (CALL_PART_TYPES.includes(String(p?.type))) {
+      const id = partToolId(p);
+      if (id) ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function resultIdsOf(msg: any): Set<string> {
+  const ids = new Set<string>();
+  if (msg?.role === "tool" && msg.tool_call_id) ids.add(String(msg.tool_call_id));
+  for (const p of Array.isArray(msg?.content) ? msg.content : []) {
+    if (RESULT_PART_TYPES.includes(String(p?.type))) {
+      const id = partToolId(p);
+      if (id) ids.add(id);
+    }
+  }
+  return ids;
+}
+
+// Returns the message without the tool parts whose ids are not in `keepIds`, or
+// null when that would leave it empty. Returns the same object when nothing changes.
+function withoutToolParts(msg: any, keepIds: Set<string>): any | null {
+  let changed = false;
+
+  let content = msg?.content;
+  if (Array.isArray(content)) {
+    const kept = content.filter((p: any) => {
+      if (!TOOL_PART_TYPES.has(String(p?.type))) return true;
+      const id = partToolId(p);
+      if (id && keepIds.has(id)) return true;
+      changed = true;
+      return false;
+    });
+    if (kept.length !== content.length) content = kept;
+  }
+
+  let toolCalls = msg?.tool_calls;
+  if (Array.isArray(toolCalls)) {
+    const kept = toolCalls.filter((c: any) => {
+      const id = c?.id ?? c?.tool_call_id;
+      if (id && keepIds.has(String(id))) return true;
+      changed = true;
+      return false;
+    });
+    if (kept.length !== toolCalls.length) toolCalls = kept;
+  }
+
+  if (msg?.role === "tool") {
+    const id = msg.tool_call_id ? String(msg.tool_call_id) : undefined;
+    if (!id || !keepIds.has(id)) return null;
+  }
+
+  if (!changed) return msg;
+  const hasText = typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
+  if (!hasText && (!toolCalls || toolCalls.length === 0)) return null;
+  return { ...msg, content, tool_calls: toolCalls };
+}
+
+// Final guard after compaction. A tool result is only valid when a matching call
+// appears somewhere EARLIER, and a call is only valid when a matching result
+// appears somewhere LATER. Compaction flattens distant-past (with interleaving
+// messages folded into the digest) in front of the recent window, so a call and
+// its result can end up separated by unrelated messages. Pairing must therefore
+// scan the whole list, not just the immediately adjacent message: a stricter
+// adjacency check deletes valid tool parts and breaks the call/result sequence
+// ("Cannot resolve tool name for tool_call_id", "tool_use_id not found").
+// Calls with no result anywhere and results with no call anywhere are dropped;
+// a message left without any tool content is dropped. Multi-call turns are kept
+// intact: every call id that resolves is preserved.
+function dropOrphanToolParts(messages: any[]): any[] {
+  // Every call id declared anywhere, and every result id seen anywhere.
+  const allCallIds = new Set<string>();
+  const allResultIds = new Set<string>();
+  for (const msg of messages) {
+    for (const id of callIdsOf(msg)) allCallIds.add(id);
+    for (const id of resultIdsOf(msg)) allResultIds.add(id);
+  }
+  // An id survives only when its call and result both exist somewhere in the
+  // list; order within the list is validated separately below.
+  const linkedIds = new Set<string>();
+  for (const id of allCallIds) if (allResultIds.has(id)) linkedIds.add(id);
+
+  const out: any[] = [];
+  const seenCallIds = new Set<string>(); // calls emitted so far (a result must follow one)
+
+  for (const msg of messages) {
+    const callIds = callIdsOf(msg);
+    const resultIds = resultIdsOf(msg);
+
+    // Keep a result only if its call already appeared earlier and both halves
+    // are linked. Keep a call only if it is linked to a result that will appear
+    // (its result may come later). Unlinked halves are dropped here.
+    const keep = new Set<string>();
+    for (const id of resultIds) {
+      if (linkedIds.has(id) && seenCallIds.has(id)) keep.add(id);
+    }
+    for (const id of callIds) {
+      if (linkedIds.has(id)) keep.add(id);
+    }
+
+    const cleaned = withoutToolParts(msg, keep);
+    for (const id of callIds) seenCallIds.add(id);
+    if (cleaned !== null) out.push(cleaned);
+  }
+
+  return out;
 }
 
 // Names of tools the model has already invoked in this session's transcript.
@@ -1841,7 +1976,7 @@ export default Plugin.define({
           });
         }
 
-        event.messages = [...compacted, ...preservedMessages, ...recentPast];
+        event.messages = dropOrphanToolParts([...compacted, ...preservedMessages, ...recentPast]);
         console.log(
           `[System One]: History compacted to ${event.messages.length} turns ` +
             `(${recentPast.length} recent + ${preservedMessages.length} preserved + ${digestLines.length} digest facts from ${dropped.length} messages).`
