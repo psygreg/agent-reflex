@@ -22,6 +22,8 @@ feature below is driven by this classifier.
 - **Syntax checks**: up to two-step checks after `edit` and `write` tool calls using parsers and the decision model
 - **Shell guardrail**: blocks commands that may damage a repository or remove files without backup; the check runs before dispatch through `reflex_run` as well
 
+- **Stuck-loop detection**: watches completed tool calls and, when the same call repeats and keeps producing the same result, injects a System One-verified "stuck loop" warning into the next model call telling the model to change approach. The classifier verdict is cached per repeating pattern so an active loop is not re-judged on every flush, and detection is deliberately conservative (only a call that repeats several times *with identical output* is a loop) so legitimate iteration passes through untouched
+
 ### Agent support
 
 Eight agents are supported. The classifier config is shared across all of them
