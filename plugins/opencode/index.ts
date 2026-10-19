@@ -28,6 +28,9 @@ const PRESET_BASE_URLS: Record<string, string | undefined> = {
 };
 
 const REQUEST_TIMEOUT_MS = 20_000;
+const SYSTEMONE_MAX_BATCH_QUESTIONS = 32;
+const SYSTEMONE_DECISION_BATCH_WINDOW_MS = 12;
+const COMPACT_SCORE_MAX_CHARS = 4_000;
 
 // Requested settings per complexity level, applied only while the agent's effort
 // is at its default. Explicit variants or provider effort settings take precedence.
@@ -982,8 +985,14 @@ function contentToText(content: unknown): string {
 
 // Stable key for the active user request, used to scope explicit tool-exposure
 // overrides to that request rather than disabling automatic exposure forever.
+function latestUserMessage(messages: any[]): any | undefined {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") return messages[i];
+  }
+}
+
 function latestUserPromptKey(messages: any[]): string {
-  const message = [...(messages ?? [])].reverse().find((item) => item?.role === "user");
+  const message = latestUserMessage(messages);
   if (!message) return "";
   if (typeof message.id === "string" && message.id) return `id:${message.id}`;
   try {
@@ -1093,6 +1102,77 @@ async function askSystemOneMany(config: SystemOneConfig, state: string, question
     }
   }
   return {};
+}
+
+// Keep decision batches bounded for smaller local models while still replacing
+// the old one-request-per-message compaction loop with a handful of batched calls.
+async function askSystemOneManyChunked(
+  config: SystemOneConfig,
+  state: string,
+  questionsById: Record<string, string>,
+): Promise<Record<string, number>> {
+  const entries = Object.entries(questionsById);
+  const answers: Record<string, number> = {};
+  for (let i = 0; i < entries.length; i += SYSTEMONE_MAX_BATCH_QUESTIONS) {
+    const batch = Object.fromEntries(entries.slice(i, i + SYSTEMONE_MAX_BATCH_QUESTIONS));
+    Object.assign(answers, await askSystemOneMany(config, state, batch));
+  }
+  return answers;
+}
+
+// Coalesce independent noul checks that arrive together from parallel tool
+// executions (permissions, confidence, and post-edit checks). Sequential checks
+// still run separately because their inputs only exist after each action.
+function createSystemOneDecisionBatcher(config: SystemOneConfig): (state: string, question: string) => Promise<number | null> {
+  const pending: Array<{
+    state: string;
+    question: string;
+    resolve: (score: number | null) => void;
+  }> = [];
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const scheduleFlush = () => {
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      void flush();
+    }, SYSTEMONE_DECISION_BATCH_WINDOW_MS);
+  };
+
+  const flush = async () => {
+    const batch = pending.splice(0, pending.length);
+    if (batch.length === 0) return;
+
+    if (batch.length === 1) {
+      try {
+        batch[0].resolve(await askSystemOne(config, batch[0].state, batch[0].question));
+      } catch {
+        batch[0].resolve(null);
+      }
+    } else {
+      const questionsById: Record<string, string> = {};
+      batch.forEach((item, index) => {
+        questionsById[`parallel_${index}`] = `Decision-specific context:\n${item.state}\n\nQuestion:\n${item.question}`;
+      });
+      try {
+        const answers = await askSystemOneManyChunked(
+          config,
+          "Evaluate each independent item using only the context embedded in that item's question. Answer each one separately.",
+          questionsById,
+        );
+        batch.forEach((item, index) => item.resolve(answers[`parallel_${index}`] ?? null));
+      } catch {
+        batch.forEach((item) => item.resolve(null));
+      }
+    }
+
+    if (pending.length > 0) scheduleFlush();
+  };
+
+  return (state, question) => new Promise((resolve) => {
+    pending.push({ state, question, resolve });
+    scheduleFlush();
+  });
 }
 
 // A "choice" decision: pick one option from named criteria. Returns the chosen key
@@ -1243,7 +1323,7 @@ async function askSystemOneChoiceMany(
 // no matching sentences are skipped. Returns the digest lines, or an empty array
 // when the classifier gives nothing usable (the caller then keeps the tail's most
 // relevant messages and nothing is lost outright).
-async function buildHistoryDigest(config: SystemOneConfig, tailText: string): Promise<string[]> {
+async function buildHistoryDigest(config: SystemOneConfig, tailText: string): Promise<{ lines: string[]; cacheable: boolean }> {
   // Split the tail into candidate sentences and score each against every bucket's
   // theme keywords. A sentence becomes a candidate for a bucket when it shares that
   // bucket's keywords.
@@ -1274,7 +1354,7 @@ async function buildHistoryDigest(config: SystemOneConfig, tailText: string): Pr
       criteria,
     };
   }
-  if (Object.keys(questionsById).length === 0) return [];
+  if (Object.keys(questionsById).length === 0) return { lines: [], cacheable: true };
 
   const answers = await askSystemOneChoiceMany(config, tailText, questionsById);
 
@@ -1286,7 +1366,7 @@ async function buildHistoryDigest(config: SystemOneConfig, tailText: string): Pr
     const chosen = bucketSentences[key]?.[idx];
     if (chosen) lines.push(`- ${bucket.description}: ${chosen}`);
   }
-  return lines;
+  return { lines, cacheable: Object.keys(answers).length > 0 };
 }
 
 // ============ TOOL EXPOSURE (give the model only the tools a task needs) ============
@@ -1370,10 +1450,13 @@ function truncateOutput(text: string, limit = 24_000): string {
 // Runs the shell guardrail on a command: true when it looks dangerous (> 0.75).
 // Fails open (false = allowed) when the classifier is unavailable, matching the
 // plugin's guardrail convention. Shared by reflex_run's dispatch paths.
-async function isDangerousCommandGuarded(config: SystemOneConfig, command: string): Promise<boolean> {
+async function isDangerousCommandGuarded(
+  config: SystemOneConfig,
+  command: string,
+  ask: (state: string, question: string) => Promise<number | null> = (state, question) => askSystemOne(config, state, question),
+): Promise<boolean> {
   try {
-    const danger = await askSystemOne(
-      config,
+    const danger = await ask(
       `Command to be executed in terminal: ${command}`,
       "Determine if this command may damage system files, remove directories without backup or leak environment keys."
     );
@@ -1774,24 +1857,72 @@ function usedToolNames(messages: any[]): Set<string> {
   return used;
 }
 
-// Applies System One tool exposure to the request's tool map (in place). Keeps the
-// always-keep core and anything already used, scores the rest, and deletes the
-// tools the task does not need. Two decision paths:
-//  1. Per-tool batch: one askSystemOneMany call scores every candidate tool at
-//     once; tools below TOOL_RELEVANCE_THRESHOLD are dropped. Used when the
-//     backend answers more than one question.
-//  2. Tier fallback: if the batch came back empty (backend single-question only),
-//     one scalar call picks a fixed tier (READ/EDIT/FULL) and everything outside
-//     it is dropped.
-// Any error or null score leaves event.tools untouched (fail-open).
+// Applies precomputed request-level decisions to the mutable tool map. The
+// per-tool scores are sent in the same batch as complexity and compaction scores;
+// a single scalar tier fallback is used only if the backend answered none of them.
 const TOOL_RELEVANCE_THRESHOLD = 0.35;
 
-async function applyToolExposure(
+interface ToolExposurePlan {
+  allNames: string[];
+  candidates: string[];
+}
+
+interface RequestDecisionCache {
+  promptKey: string;
+  complexityResolved: boolean;
+  complexityScore: number | null;
+  toolAttempted: Set<string>;
+  toolScoresByName: Record<string, number>;
+  toolTierResolved: boolean;
+  toolTierScore: number | null;
+  historyScores: Map<string, number | null>;
+}
+
+function createRequestDecisionCache(promptKey: string): RequestDecisionCache {
+  return {
+    promptKey,
+    complexityResolved: false,
+    complexityScore: null,
+    toolAttempted: new Set(),
+    toolScoresByName: {},
+    toolTierResolved: false,
+    toolTierScore: null,
+    historyScores: new Map(),
+  };
+}
+
+function historyMessageKey(message: any): string {
+  const role = String(message?.role ?? "unknown");
+  if (typeof message?.id === "string" && message.id) return `${role}:id:${message.id}`;
+  try {
+    return `${role}:content:${JSON.stringify(message?.content ?? message)}`;
+  } catch {
+    return `${role}:content:${contentToText(message?.content)}`;
+  }
+}
+
+function planToolExposure(
+  config: SystemOneConfig,
+  event: { tools: Record<string, unknown>; messages: any[] },
+  forceAll: boolean,
+  userPrompt: string,
+): ToolExposurePlan | null {
+  if (config.toolExposure !== "auto" || forceAll || !event.tools || !userPrompt.trim()) return null;
+  const allNames = Object.keys(event.tools);
+  const used = usedToolNames(event.messages);
+  const candidates = allNames.filter((name) => !TOOL_CORE.has(name) && !used.has(name));
+  return candidates.length > 0 ? { allNames, candidates } : null;
+}
+
+function applyToolExposure(
   config: SystemOneConfig,
   event: { tools: Record<string, unknown>; messages: any[] },
   forceAll = false,
   availableTools?: Record<string, unknown>,
-): Promise<void> {
+  plan: ToolExposurePlan | null = null,
+  scoresByName: Record<string, number> = {},
+  tierScore: number | null = null,
+): void {
   if (config.toolExposure !== "auto") return;
   const tools = event.tools;
   if (!tools) return;
@@ -1807,50 +1938,28 @@ async function applyToolExposure(
     return;
   }
 
-  const allNames = Object.keys(tools);
-  const used = usedToolNames(event.messages);
-  const candidates = allNames.filter((name) => !TOOL_CORE.has(name) && !used.has(name));
-  if (candidates.length === 0) return;
-
-  const lastMessage = event.messages[event.messages.length - 1];
-  const userPrompt = contentToText(lastMessage?.content);
-  const state = `User request: ${userPrompt.trim()}`;
-
-  try {
-    // Path 1: score every candidate tool in one call.
-    const questionsById: Record<string, string> = {};
+  if (!plan) return;
+  const candidates = plan.candidates.filter((name) => name in tools);
+  const answered = candidates.filter((name) => typeof scoresByName[name] === "number");
+  if (answered.length > 0) {
     for (const name of candidates) {
-      questionsById[name] = `Would the "${name}" tool be needed to fully answer this user request? Answer YES only if this specific tool is likely required.`;
+      const score = scoresByName[name];
+      // Drop only tools the backend explicitly deemed irrelevant. A candidate
+      // the backend did not answer is kept (fail-open per tool).
+      if (typeof score === "number" && score < TOOL_RELEVANCE_THRESHOLD) delete tools[name];
     }
-    const scores = await askSystemOneMany(config, state, questionsById);
+    console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${plan.allNames.length} tools (per-tool scoring).`);
+    return;
+  }
 
-    const answered = candidates.filter((name) => typeof scores[name] === "number");
-    if (answered.length > 0) {
-      for (const name of candidates) {
-        const score = scores[name];
-        // Drop only tools the backend explicitly deemed irrelevant. A candidate
-        // the backend did not answer is kept (fail-open per tool).
-        if (typeof score === "number" && score < TOOL_RELEVANCE_THRESHOLD) delete tools[name];
-      }
-      console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${allNames.length} tools (per-tool scoring).`);
-      return;
-    }
-
-    // Path 2: batch unsupported -> one scalar picks a tier.
-    const needScore = await askSystemOne(
-      config,
-      state,
-      "Does solving this request require running shell commands, editing or writing files, or anything beyond reading and searching? YES means it needs more than read-only tools."
-    );
-    if (needScore === null) return; // fail-open: keep all tools
-
-    const tier = TOOL_TIERS[tierForScore(needScore)];
+  // When the batched request returned no per-tool answers, the context hook has
+  // already asked the scalar tier fallback and cached its answer for this prompt.
+  if (tierScore !== null) {
+    const tier = TOOL_TIERS[tierForScore(tierScore)];
     for (const name of candidates) {
       if (!tier.match(name)) delete tools[name];
     }
-    console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${allNames.length} tools (tier ${tierForScore(needScore)}).`);
-  } catch (error: any) {
-    console.warn(`[System One Tools]: Tool exposure failed (${error.message}); keeping all tools.`);
+    console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${plan.allNames.length} tools (tier ${tierForScore(tierScore)}).`);
   }
 }
 
@@ -1966,10 +2075,13 @@ export default Plugin.define({
     }
 
     console.log(`[System One Orchestrator]: Initialized (${config.model} @ ${config.baseURL}), monitoring context...`);
+    const askSystemOneQueued = createSystemOneDecisionBatcher(config);
 
     // Estado por sessão: complexidade da tarefa atual
     const levelBySession = new Map<string, EffortLevel>();
     const dynamicEffortBySession = new Map<string, boolean>();
+    const requestDecisionsBySession = new Map<string, RequestDecisionCache>();
+    const historyDigestBySession = new Map<string, { tailText: string; lines: string[] }>();
     // Snapshot the unfiltered tool map per user request so the recovery tool can
     // restore tools removed by auto exposure on the next model call.
     const availableToolsBySession = new Map<string, { promptKey: string; tools: Record<string, unknown> }>();
@@ -1990,6 +2102,16 @@ export default Plugin.define({
       if (messages.length < 1) return;
 
       const promptKey = latestUserPromptKey(messages);
+      const userMessage = latestUserMessage(messages);
+      const userPrompt0 = contentToText(userMessage?.content);
+      let decisionCache = promptKey ? requestDecisionsBySession.get(event.sessionID) : undefined;
+      if (promptKey && (!decisionCache || decisionCache.promptKey !== promptKey)) {
+        if (decisionCache) levelBySession.delete(event.sessionID);
+        decisionCache = createRequestDecisionCache(promptKey);
+        requestDecisionsBySession.set(event.sessionID, decisionCache);
+      }
+      if (!decisionCache) decisionCache = createRequestDecisionCache(promptKey);
+
       const previousTools = availableToolsBySession.get(event.sessionID);
       const previousOverride = exposeAllToolsBySession.get(event.sessionID);
       if (
@@ -1999,6 +2121,7 @@ export default Plugin.define({
         availableToolsBySession.delete(event.sessionID);
         exposeAllToolsBySession.delete(event.sessionID);
       }
+
       const forceAllTools = Boolean(promptKey && exposeAllToolsBySession.get(event.sessionID) === promptKey);
       if (promptKey && event.tools && !forceAllTools) {
         const currentSnapshot = availableToolsBySession.get(event.sessionID);
@@ -2014,26 +2137,95 @@ export default Plugin.define({
       }
       const availableTools = availableToolsBySession.get(event.sessionID);
 
-      // ---- COMPLEXITY CLASSIFICATION (shared by compaction + parameter modulation) ----
-      // Classified once per request. It sizes the compaction keep window and drives
-      // maxTokens / the confidence suggestion below. Kept as (level, score) so the
-      // request is classified with a single classifier round-trip.
-      const lastMessage0 = messages[messages.length - 1];
-      const userPrompt0 = contentToText(lastMessage0?.content);
-      let level: EffortLevel = "medium";
-      let complexityScore: number | null = null;
-      if (userPrompt0 && !userPrompt0.includes("[object Object]")) {
-        try {
-          complexityScore = await askSystemOne(
-            config,
-            `User prompt: ${userPrompt0.trim()}`,
-            "Does this prompt require deep logic thinking, complex algorithms or mathematical/concurrence bugs?"
+      // Complexity, tool exposure and any uncached history scores are all
+      // decisions about this request, so put them in one typed System One batch.
+      // The results are cached by user-message ID and reused across tool turns.
+      const exposurePlan = planToolExposure(config, event, forceAllTools, userPrompt0);
+      const questionsById: Record<string, string> = {};
+      const questionTargets = new Map<string, { kind: "complexity" | "tool" | "history"; name?: string; key?: string }>();
+      let decisionQuestionNumber = 0;
+      const addDecisionQuestion = (
+        target: { kind: "complexity" | "tool" | "history"; name?: string; key?: string },
+        instructions: string,
+      ) => {
+        const id = `decision_${decisionQuestionNumber++}`;
+        questionsById[id] = instructions;
+        questionTargets.set(id, target);
+      };
+
+      if (!decisionCache.complexityResolved) {
+        if (userPrompt0 && !userPrompt0.includes("[object Object]")) {
+          addDecisionQuestion(
+            { kind: "complexity" },
+            "Does this user request require deep logic thinking, complex algorithms or mathematical/concurrency bugs?",
           );
-          if (complexityScore !== null) level = classifyComplexity(complexityScore);
-        } catch {
-          complexityScore = null;
+        } else {
+          decisionCache.complexityResolved = true;
         }
       }
+
+      for (const name of exposurePlan?.candidates ?? []) {
+        if (decisionCache.toolAttempted.has(name)) continue;
+        decisionCache.toolAttempted.add(name);
+        addDecisionQuestion(
+          { kind: "tool", name },
+          `Would the "${name}" tool be needed to fully answer this user request? Answer YES only if this specific tool is likely required.`,
+        );
+      }
+      const historyToScore = messages.length > COMPACT_MIN_MESSAGES
+        ? messages.slice(0, -COMPACT_KEEP_RECENT.simple)
+        : [];
+      for (const msg of historyToScore) {
+        const key = historyMessageKey(msg);
+        if (decisionCache.historyScores.has(key)) continue;
+        const msgContent = contentToText(msg.content) || JSON.stringify(msg.content);
+        const excerpt = msgContent.length > COMPACT_SCORE_MAX_CHARS
+          ? `${msgContent.slice(0, COMPACT_SCORE_MAX_CHARS)}… [message excerpt truncated]`
+          : msgContent;
+        addDecisionQuestion(
+          { kind: "history", key },
+          `Old history message:\n[${String(msg.role).toUpperCase()}]: ${excerpt}\n\nIs this message load-bearing context the model still needs — a requirement, rule, key decision, API shape, or prior finding that later work depends on? Answer YES only if losing it would change the answer.`,
+        );
+      }
+
+      if (Object.keys(questionsById).length > 0) {
+        const state = `User request: ${userPrompt0.trim() || "(no plain-text user request)"}`;
+        let scores: Record<string, number> = {};
+        try {
+          scores = await askSystemOneManyChunked(config, state, questionsById);
+        } catch (error: any) {
+          console.warn(`[System One]: Batched request decisions failed (${error.message}); using fail-open defaults.`);
+        }
+        for (const [id, target] of questionTargets) {
+          const score = scores[id];
+          if (target.kind === "complexity") {
+            decisionCache.complexityResolved = true;
+            decisionCache.complexityScore = typeof score === "number" ? score : null;
+          } else if (target.kind === "tool" && target.name) {
+            if (typeof score === "number") decisionCache.toolScoresByName[target.name] = score;
+          } else if (target.kind === "history" && target.key) {
+            decisionCache.historyScores.set(target.key, typeof score === "number" ? score : null);
+          }
+        }
+      }
+
+      const toolCandidates = exposurePlan?.candidates ?? [];
+      const hasPerToolAnswer = toolCandidates.some((name) => typeof decisionCache.toolScoresByName[name] === "number");
+      if (hasPerToolAnswer) {
+        decisionCache.toolTierResolved = true;
+      }
+      if (toolCandidates.length > 0 && !hasPerToolAnswer && !decisionCache.toolTierResolved) {
+        decisionCache.toolTierScore = await askSystemOne(
+          config,
+          `User request: ${userPrompt0.trim()}`,
+          "Does solving this request require running shell commands, editing or writing files, or anything beyond reading and searching? YES means it needs more than read-only tools.",
+        );
+        decisionCache.toolTierResolved = true;
+      }
+      if (promptKey) requestDecisionsBySession.set(event.sessionID, decisionCache);
+
+      const complexityScore = decisionCache.complexityScore;
+      const level: EffortLevel = complexityScore === null ? "medium" : classifyComplexity(complexityScore);
 
       // ---- SUB-ROUTINE A: DECISION-DRIVEN HISTORY COMPACTION ----
       // Keeps the most recent messages verbatim (keep window sized by the level),
@@ -2045,25 +2237,13 @@ export default Plugin.define({
         const distantPast = messages.slice(0, -keepRecent);
         const recentPast = messages.slice(-keepRecent);
 
-        // Structural messages (tool calls/results) are scored too — they dominate a
-        // long session and are the main reason it "doesn't compact enough". Only a
-        // structural message that is clearly load-bearing survives verbatim; the
-        // rest fold into the digest. The keep window still protects in-flight work.
-        const scored: Array<{ msg: any; score: number | null }> = [];
-        for (const msg of distantPast) {
-          const msgContent = contentToText(msg.content) || JSON.stringify(msg.content);
-          let score: number | null = null;
-          try {
-            score = await askSystemOne(
-              config,
-              `Old history message:\n[${String(msg.role).toUpperCase()}]: ${msgContent}`,
-              "Is this message load-bearing context the model still needs — a requirement, rule, key decision, API shape, or prior finding that later work depends on? Answer YES only if losing it would change the answer."
-            );
-          } catch {
-            score = null;
-          }
-          scored.push({ msg, score });
-        }
+        // Structural messages are scored too. Their decisions were included in
+        // the request-level batch above and cached by message identity, so tool
+        // continuations do not re-send the same old messages one by one.
+        const scored: Array<{ msg: any; score: number | null }> = distantPast.map((msg) => ({
+          msg,
+          score: decisionCache.historyScores.get(historyMessageKey(msg)) ?? null,
+        }));
 
         // Keep the highest-relevance older messages verbatim, bounded so a long
         // session cannot preserve its whole tail. A null score (classifier
@@ -2088,10 +2268,17 @@ export default Plugin.define({
           .join("\n")
           .slice(0, 12_000);
         let digestLines: string[] = [];
-        try {
-          digestLines = await buildHistoryDigest(config, tailText);
-        } catch {
-          digestLines = [];
+        const cachedDigest = historyDigestBySession.get(event.sessionID);
+        if (cachedDigest?.tailText === tailText) {
+          digestLines = cachedDigest.lines;
+        } else {
+          try {
+            const digest = await buildHistoryDigest(config, tailText);
+            digestLines = digest.lines;
+            if (digest.cacheable) historyDigestBySession.set(event.sessionID, { tailText, lines: digest.lines });
+          } catch {
+            digestLines = [];
+          }
         }
 
         const compacted: any[] = [];
@@ -2116,9 +2303,8 @@ export default Plugin.define({
       }
 
       // ---- SUB-ROUTINE B: PRE-EVALUATION AND COMPLEXITY INJECTION ----
-      // Uses the shared classification computed at the top of this hook (one
-      // classifier call per request) to set maxTokens and suggest the confidence
-      // tool on medium/high tasks.
+      // Uses the cached request-level classification to set maxTokens and suggest
+      // the confidence tool on medium/high tasks. Tool continuations reuse it.
       if (complexityScore !== null) {
         levelBySession.set(event.sessionID, level);
         if (!userEffortOverride) {
@@ -2148,11 +2334,14 @@ export default Plugin.define({
       // classifier error and never drops the always-keep core or a tool the model
       // has already used this session. Runs last so it always has the final word
       // on event.tools for this request.
-      await applyToolExposure(
+      applyToolExposure(
         config,
         event,
         forceAllTools,
         availableTools?.promptKey === promptKey ? availableTools.tools : undefined,
+        exposurePlan,
+        decisionCache.toolScoresByName,
+        decisionCache.toolTierScore,
       );
     });
 
@@ -2280,8 +2469,7 @@ export default Plugin.define({
           const threshold = level === "simple" ? 0.75 : 0.85;
 
           try {
-            const confidence = await askSystemOne(
-              config,
+            const confidence = await askSystemOneQueued(
               `AI line of thought:\n${thought}`,
               "Does this line of thought seem direct, correct and without hesitation or redundant loops?"
             );
@@ -2476,7 +2664,7 @@ export default Plugin.define({
           // Guardrail before dispatching a shell-like tool (its schema takes a command).
           const command = typeof args.command === "string" ? args.command : typeof args.cmd === "string" ? args.cmd : "";
           const isShell = Boolean(command) || /command|cmd|script|exec/i.test(Object.keys(args).join(" "));
-          if (isShell && command && (await isDangerousCommandGuarded(config, command))) {
+          if (isShell && command && (await isDangerousCommandGuarded(config, command, askSystemOneQueued))) {
             return { content: `[GUARDRAIL BLOCKED]: Potentially dangerous command aborted. Not running it: ${command}` };
           }
 
@@ -2512,8 +2700,7 @@ export default Plugin.define({
       if (!commandText) return;
 
       try {
-        const dangerScore = await askSystemOne(
-          config,
+        const dangerScore = await askSystemOneQueued(
           `Command to be executed in terminal: ${commandText}`,
           "Determine if this command may damage system files, remove directories without backup or leak environment keys."
         );
@@ -2567,8 +2754,7 @@ export default Plugin.define({
             const content = await readFile(filePath, "utf8");
             const edited = event.input?.newString ?? event.input?.content ?? event.args?.newString ?? event.args?.content;
             const excerpt = excerptAroundEdit(content, edited);
-            const bugScore = await askSystemOne(
-              config,
+            const bugScore = await askSystemOneQueued(
               `Excerpt of edited file ${filePath}. It contains only the edited code plus ${SEMANTIC_CHECK_CONTEXT_LINES} lines on each side, so code outside it is not shown:\n${excerpt}`,
               "Does this code contain a bug that would prevent it from running or produce a wrong result? Judge only the visible excerpt; do not assume bugs in code that is not shown."
             );

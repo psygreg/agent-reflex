@@ -81,6 +81,10 @@ capability below is driven by this classifier.
   Everything is exposed if the classifier is unavailable. If filtering hides a
   needed tool, `systemone_reveal_tools` lists the agent's tool pool and restores
   all its schemas for the current user request.
+  OpenCode batches complexity, tool-relevance, and compaction-relevance decisions
+  per user request and reuses them across tool continuations; parallel safety/edit
+  checks share a batch when their hooks arrive together. Sequential safety and
+  edit checks remain per action because their inputs are only available then.
 - **Tool dispatch** (`reflex_run`): an optional fallback tool for when the model
   cannot decide which underlying tool a task needs. It asks the decision model
   which tool to use (a `choice` decision), runs it, and returns its real output.
