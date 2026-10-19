@@ -59,11 +59,11 @@ capability below is driven by this classifier.
   the Anthropic surface), Moonshot Kimi 2.7+/K3 (`reasoning_effort` on K3,
   `thinking.type` toggle on K2.7/K2.6), xAI Grok 4.3+ (`reasoning_effort`, or
   `reasoning.effort` on Responses; `none` disables on grok-4.3 only, `xhigh`
-  tops out on grok-4.3/4.6+), MiniMax M3+ (`thinking.type` on/off — `adaptive`
-  / `disabled`, never `enabled` — on MiniMax-M3; `reasoning_effort` tunes depth
-  on M3.1-Flash, and `reasoning.effort` on Responses; `none` is rejected, so
-  simple maps to the lowest effort), local llama.cpp/Ollama
-  (`reasoning_effort`, plus `chat_template_kwargs` on llama.cpp). Dialects are
+  tops out on grok-4.3/4.6+), MiniMax M3+ (`thinking.type: adaptive` stays on
+  for MiniMax-M3 agent turns because disabling it can yield empty responses;
+  `reasoning_effort` / `output_config.effort` tunes M3.1-Flash, and
+  `reasoning.effort` is used on Responses; `none` is rejected), local
+  llama.cpp/Ollama (`reasoning_effort`, plus `chat_template_kwargs` on llama.cpp). Dialects are
   detected per request, so multimodel setups never send a foreign field;
   models without a wired dialect stay untouched.
 - **Confidence tool**: the `systemone_check_confidence` tool scores the

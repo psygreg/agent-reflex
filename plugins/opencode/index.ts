@@ -674,18 +674,20 @@ function applyGrokLevel(body: any, level: EffortLevel, url: string): boolean {
 // M2.x and older think at a fixed depth and can neither be disabled nor tuned,
 // so they are left untouched rather than risk a foreign or 400ing field.
 const MINIMAX_LEVEL_REQUEST = {
-  simple: { thinking: false, effort: "low" },
-  medium: { thinking: true, effort: "medium" },
-  high: { thinking: true, effort: "max" },
+  // MiniMax-M3 needs adaptive thinking for reliable agent/tool turns. Keep it
+  // enabled even on simple prompts; disabling it can produce an empty response.
+  simple: { effort: "low" },
+  medium: { effort: "medium" },
+  high: { effort: "max" },
 } as const;
 
 // MiniMax capabilities parsed from the model id in a request body.
-// canDisable: thinking can be switched off (thinking.type "disabled") — MiniMax-M3
-// only. Models that cannot disable thinking fall back to the lowest effort on the
-// simple level. tunable: reasoning_effort tunes thinking depth — MiniMax-M3.1-
-// Flash-Preview only. Models that do not tune get the on/off switch alone.
+// supportsThinkingToggle: M3 accepts thinking.type, but the agent always sets it
+// to adaptive because disabling it can yield an empty response. M3.1+ cannot
+// disable thinking and instead tunes depth through effort. Models without either
+// capability are left untouched.
 interface MiniMaxModel {
-  canDisable: boolean;
+  supportsThinkingToggle: boolean;
   tunable: boolean;
 }
 
@@ -705,7 +707,7 @@ function parseMiniMaxModel(model: unknown): MiniMaxModel | null {
   if (major < 3) return null;
   return {
     // thinking.type "disabled" is accepted by MiniMax-M3 only (M3.1-Flash 400s).
-    canDisable: minor === 0,
+    supportsThinkingToggle: minor === 0,
     // reasoning_effort tunes depth on M3.1-Flash-Preview only (M3 ignores it).
     tunable: minor > 0,
   };
@@ -726,21 +728,22 @@ function parseMiniMaxModel(model: unknown): MiniMaxModel | null {
 // - /responses (MiniMax's OpenAI Responses surface): reasoning.effort, whose
 //   "none" is rejected exactly like reasoning_effort, so the simple level sends
 //   the lowest effort there.
-// Simple turns thinking off where the model allows it (MiniMax-M3), else drops to
-// the lowest effort. presence_penalty, frequency_penalty and logit_bias are
-// ignored by MiniMax, but those are the caller's fields and are left alone here.
+// MiniMax-M3 keeps adaptive thinking enabled at every level: disabling it can
+// yield an empty response, and agent turns need its interleaved reasoning to
+// consume tool results reliably. Simple M3.1 turns use the lowest effort instead.
+// presence_penalty, frequency_penalty and logit_bias are ignored by MiniMax, but
+// those are the caller's fields and are left alone here.
 function applyMiniMaxLevel(body: any, level: EffortLevel, url: string): boolean {
   const minimax = parseMiniMaxModel(body?.model);
   if (!minimax) return false;
 
   const request = MINIMAX_LEVEL_REQUEST[level];
   const pathname = url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
-  const off = level === "simple" && minimax.canDisable;
 
   if (isAnthropicMessagesEndpoint(url)) {
-    // MiniMax's /messages: thinking.type toggle (M3 only, default off here) and
-    // output_config.effort for depth (M3.1-Flash only). "none" is not accepted.
-    if (minimax.canDisable) body.thinking = { type: off ? "disabled" : "adaptive" };
+    // MiniMax's /messages: keep M3 adaptive at every level; M3.1-Flash always
+    // thinks and tunes depth through output_config.effort. "none" is not accepted.
+    if (minimax.supportsThinkingToggle) body.thinking = { type: "adaptive" };
     if (minimax.tunable) body.output_config = { ...(body.output_config ?? {}), effort: request.effort };
     return true;
   }
@@ -756,7 +759,7 @@ function applyMiniMaxLevel(body: any, level: EffortLevel, url: string): boolean 
       body.reasoning = { effort: request.effort };
       return true;
     }
-    if (minimax.canDisable) body.thinking = { type: off ? "disabled" : "adaptive" };
+    if (minimax.supportsThinkingToggle) body.thinking = { type: "adaptive" };
     if (minimax.tunable) body.reasoning_effort = request.effort;
     return true;
   }
@@ -1480,7 +1483,8 @@ function buildArgsFromSchema(schema: any, task: string, target: string): { args:
 // as atomic (either both survive verbatim or both fold into the digest).
 function toolCallLinkIds(msg: any): string[] {
   const ids: string[] = [];
-  if (msg?.tool_call_id) ids.push(String(msg.tool_call_id));
+  const messageToolId = msg?.tool_call_id ?? msg?.toolCallId ?? msg?.tool_use_id ?? msg?.toolUseId;
+  if (messageToolId) ids.push(String(messageToolId));
   for (const call of msg?.tool_calls ?? []) {
     const id = call?.id ?? call?.tool_call_id;
     if (id) ids.push(String(id));
@@ -1575,7 +1579,10 @@ function callIdsOf(msg: any): Set<string> {
 
 function resultIdsOf(msg: any): Set<string> {
   const ids = new Set<string>();
-  if (msg?.role === "tool" && msg.tool_call_id) ids.add(String(msg.tool_call_id));
+  if (msg?.role === "tool") {
+    const messageToolId = msg?.tool_call_id ?? msg?.toolCallId ?? msg?.tool_use_id ?? msg?.toolUseId;
+    if (messageToolId) ids.add(String(messageToolId));
+  }
   for (const p of Array.isArray(msg?.content) ? msg.content : []) {
     if (RESULT_PART_TYPES.includes(String(p?.type))) {
       const id = partToolId(p);
@@ -1614,8 +1621,16 @@ function withoutToolParts(msg: any, keepIds: Set<string>): any | null {
   }
 
   if (msg?.role === "tool") {
-    const id = msg.tool_call_id ? String(msg.tool_call_id) : undefined;
-    if (!id || !keepIds.has(id)) return null;
+    // OpenCode v2 stores the tool-call ID on each `tool-result` content part,
+    // while OpenAI-compatible messages commonly store it on the message itself.
+    // Accept either representation or valid results disappear during compaction.
+    const messageToolId = msg?.tool_call_id ?? msg?.toolCallId ?? msg?.tool_use_id ?? msg?.toolUseId;
+    const retainedPartResult = Array.isArray(content) && content.some((part: any) => {
+      if (!RESULT_PART_TYPES.includes(String(part?.type))) return false;
+      const id = partToolId(part);
+      return Boolean(id && keepIds.has(id));
+    });
+    if (messageToolId ? !keepIds.has(String(messageToolId)) : !retainedPartResult) return null;
   }
 
   if (!changed) return msg;
