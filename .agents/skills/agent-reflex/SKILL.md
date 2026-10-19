@@ -47,8 +47,11 @@ capability below is driven by this classifier.
 - **Complexity classification**: every prompt is scored *simple*, *medium* or
   *high*; `maxTokens` is set per level and medium/high prompts get a system
   note suggesting a confidence check before committing to a solution.
-- **Automatic effort control**: the level is written into every primary model
-  request in the dialect the requested model actually speaks. Wired dialects:
+- **Automatic effort control**: when the agent has no non-default model variant
+  or explicit effort setting, the classified level is written into each primary
+  request in the dialect the requested model actually speaks, and sets the
+  matching `maxTokens` cap. User-selected variants and effort settings take
+  precedence. Wired dialects:
   Claude (`output_config.effort`), GPT reasoning models (`reasoning.effort` /
   `reasoning_effort`), GLM-5.2+ (`thinking.type` + `reasoning_effort`), Xiaomi
   MiMo V2.5+ (`thinking.type`, or `reasoning.effort` / `reasoning_effort` on

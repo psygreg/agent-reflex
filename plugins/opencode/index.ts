@@ -29,7 +29,8 @@ const PRESET_BASE_URLS: Record<string, string | undefined> = {
 
 const REQUEST_TIMEOUT_MS = 20_000;
 
-// Requested settings per complexity level.
+// Requested settings per complexity level, applied only while the agent's effort
+// is at its default. Explicit variants or provider effort settings take precedence.
 // effort: Anthropic output_config.effort; OpenAI Responses reasoning.effort /
 // Chat Completions reasoning_effort; local reasoning_effort ("low" keeps
 // thinking at its lowest level).
@@ -49,6 +50,46 @@ function classifyComplexity(score: number): EffortLevel {
   if (score > 0.80) return "high";
   if (score > 0.50) return "medium";
   return "simple";
+}
+
+function isExplicitEffortValue(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value !== "string") return true;
+  const normalized = value.trim().toLowerCase();
+  return normalized !== "" && normalized !== "default" && normalized !== "auto";
+}
+
+function hasExplicitEffortOptions(options: any, visited = new Set<object>()): boolean {
+  if (!options || typeof options !== "object") return false;
+  if (visited.has(options)) return false;
+  visited.add(options);
+  const values = [
+    options.reasoningEffort,
+    options.reasoning_effort,
+    options.effort,
+    options.reasoning?.effort,
+    options.outputConfig?.effort,
+    options.output_config?.effort,
+    options.thinking?.type,
+    options.thinking?.budgetTokens,
+    options.thinking?.budget_tokens,
+    options.enableThinking,
+    options.enable_thinking,
+  ];
+  if (values.some(isExplicitEffortValue)) return true;
+
+  // Provider-specific settings may be nested by provider ID or under `body`.
+  for (const nested of Object.values(options)) {
+    if (nested && typeof nested === "object" && hasExplicitEffortOptions(nested, visited)) return true;
+  }
+  return false;
+}
+
+// OpenCode exposes an explicitly selected model variant on Model.Ref and passes
+// provider/agent settings through context options. A missing/default variant with
+// no effort option means the plugin may apply its per-request complexity level.
+function hasUserEffortOverride(model: any, options: any): boolean {
+  return isExplicitEffortValue(model?.variant) || hasExplicitEffortOptions(options);
 }
 
 // ---- HISTORY COMPACTION (decision-driven) ----
@@ -1928,6 +1969,7 @@ export default Plugin.define({
 
     // Estado por sessão: complexidade da tarefa atual
     const levelBySession = new Map<string, EffortLevel>();
+    const dynamicEffortBySession = new Map<string, boolean>();
     // Snapshot the unfiltered tool map per user request so the recovery tool can
     // restore tools removed by auto exposure on the next model call.
     const availableToolsBySession = new Map<string, { promptKey: string; tools: Record<string, unknown> }>();
@@ -1941,6 +1983,9 @@ export default Plugin.define({
     // Runs before every model call of the agent loop.
     // ==========================================
     await ctx.session.hook("context", async (event) => {
+      const userEffortOverride = hasUserEffortOverride(event.model, event.options);
+      dynamicEffortBySession.set(event.sessionID, !userEffortOverride);
+
       const messages = event.messages || [];
       if (messages.length < 1) return;
 
@@ -2076,13 +2121,15 @@ export default Plugin.define({
       // tool on medium/high tasks.
       if (complexityScore !== null) {
         levelBySession.set(event.sessionID, level);
-        // Clamp the level cap to opencode's pre-filled model-aware default
-        // (model catalog output limit, fitted to the room the prompt leaves),
-        // so a level cap never exceeds what the model can actually emit.
-        const wanted = LEVEL_REQUEST[level].maxTokens;
-        const cap = event.options.maxTokens;
-        event.options.maxTokens =
-          typeof cap === "number" && cap > 0 ? Math.min(wanted, cap) : wanted;
+        if (!userEffortOverride) {
+          // Clamp the level cap to opencode's pre-filled model-aware default
+          // (model catalog output limit, fitted to the room the prompt leaves),
+          // so a level cap never exceeds what the model can actually emit.
+          const wanted = LEVEL_REQUEST[level].maxTokens;
+          const cap = event.options.maxTokens;
+          event.options.maxTokens =
+            typeof cap === "number" && cap > 0 ? Math.min(wanted, cap) : wanted;
+        }
 
         if (level === "simple") {
           console.log(`[System One]: Simple task (${(complexityScore * 100).toFixed(0)}%). Optimizing for speed.`);
@@ -2111,7 +2158,8 @@ export default Plugin.define({
 
     // ==========================================
     // HOOK 2: EFFORT ON EVERY PRIMARY REQUEST
-    // Applies the session's level to each request body, including tool continuations.
+    // Applies the session's level to each request body, including tool continuations,
+    // unless the agent has an explicit non-default effort/variant setting.
     // The dialect is detected per request from the model actually being requested
     // (event.model), so every model gets only the fields its own API accepts —
     // including when one gateway (OpenCode Go) proxies many models on one server.
@@ -2119,6 +2167,7 @@ export default Plugin.define({
     // ==========================================
     await ctx.session.hook("http.request", async (event) => {
       if (event.kind !== "primary") return;
+      if (dynamicEffortBySession.get(event.sessionID) !== true) return;
       const level = levelBySession.get(event.sessionID);
       if (!level) return;
 
