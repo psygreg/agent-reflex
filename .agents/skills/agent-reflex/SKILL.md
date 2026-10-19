@@ -75,7 +75,9 @@ capability below is driven by this classifier.
   `systemone_check_confidence`, so the model can always follow the confidence
   guidance on complex tasks. Only the long tail (web, exec, subagents…) is
   trimmed to what the task clearly needs or the model already used this session.
-  Everything is exposed if the classifier is unavailable.
+  Everything is exposed if the classifier is unavailable. If filtering hides a
+  needed tool, `systemone_reveal_tools` lists the agent's tool pool and restores
+  all its schemas for the current user request.
 - **Tool dispatch** (`reflex_run`): an optional fallback tool for when the model
   cannot decide which underlying tool a task needs. It asks the decision model
   which tool to use (a `choice` decision), runs it, and returns its real output.

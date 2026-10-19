@@ -894,6 +894,7 @@ function detectBackend(model: { providerID?: string; id?: string } | undefined, 
 const SHELL_ACTIONS = new Set(["bash", "shell", "terminal"]);
 
 const CONFIDENCE_TOOL = "systemone_check_confidence";
+const TOOL_EXPOSURE_TOOL = "systemone_reveal_tools";
 
 // Effort dialect a primary request may speak, decided per request from the model
 // being requested. "local": a local inference server (llama.cpp or Ollama) on a
@@ -936,6 +937,19 @@ function contentToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.map((b: any) => b.text || b.content || "").join(" ");
   return "";
+}
+
+// Stable key for the active user request, used to scope explicit tool-exposure
+// overrides to that request rather than disabling automatic exposure forever.
+function latestUserPromptKey(messages: any[]): string {
+  const message = [...(messages ?? [])].reverse().find((item) => item?.role === "user");
+  if (!message) return "";
+  if (typeof message.id === "string" && message.id) return `id:${message.id}`;
+  try {
+    return `content:${JSON.stringify(message.content)}`;
+  } catch {
+    return `content:${contentToText(message.content)}`;
+  }
 }
 
 // Asks a yes/no question to a System One endpoint (the local runtimes' System One
@@ -1248,7 +1262,8 @@ async function buildHistoryDigest(config: SystemOneConfig, tailText: string): Pr
 // dispatch path), so the model can always reach for it when it cannot decide which
 // tool to call. The confidence tool is kept too: the context hook may explicitly
 // instruct the model to call it, while tool relevance scoring only sees the user
-// prompt and could otherwise remove it as irrelevant.
+// prompt and could otherwise remove it as irrelevant. The tool-exposure recovery
+// tool is also core so it can restore the tools removed by this hook.
 const TOOL_CORE = new Set([
   "read",
   "grep",
@@ -1260,6 +1275,7 @@ const TOOL_CORE = new Set([
   "task",
   "reflex_run",
   CONFIDENCE_TOOL,
+  TOOL_EXPOSURE_TOOL,
 ]);
 
 // Fallback tiers used when the per-tool batch is not supported by the classifier
@@ -1729,14 +1745,28 @@ function usedToolNames(messages: any[]): Set<string> {
 // Any error or null score leaves event.tools untouched (fail-open).
 const TOOL_RELEVANCE_THRESHOLD = 0.35;
 
-async function applyToolExposure(config: SystemOneConfig, event: { tools: Record<string, unknown>; messages: any[] }): Promise<void> {
+async function applyToolExposure(
+  config: SystemOneConfig,
+  event: { tools: Record<string, unknown>; messages: any[] },
+  forceAll = false,
+  availableTools?: Record<string, unknown>,
+): Promise<void> {
   if (config.toolExposure !== "auto") return;
   const tools = event.tools;
   if (!tools) return;
 
-  const allNames = Object.keys(tools);
-  if (allNames.length <= TOOL_CORE.size) return; // nothing meaningful to trim
+  if (forceAll) {
+    if (availableTools) {
+      for (const name of Object.keys(tools)) {
+        if (!(name in availableTools)) delete tools[name];
+      }
+      Object.assign(tools, availableTools);
+      console.log(`[System One Tools]: Restored all ${Object.keys(tools).length} tools for this user request.`);
+    }
+    return;
+  }
 
+  const allNames = Object.keys(tools);
   const used = usedToolNames(event.messages);
   const candidates = allNames.filter((name) => !TOOL_CORE.has(name) && !used.has(name));
   if (candidates.length === 0) return;
@@ -1898,6 +1928,10 @@ export default Plugin.define({
 
     // Estado por sessão: complexidade da tarefa atual
     const levelBySession = new Map<string, EffortLevel>();
+    // Snapshot the unfiltered tool map per user request so the recovery tool can
+    // restore tools removed by auto exposure on the next model call.
+    const availableToolsBySession = new Map<string, { promptKey: string; tools: Record<string, unknown> }>();
+    const exposeAllToolsBySession = new Map<string, string>();
 
     // Consecutive failed checks per session and file. Reset when a check passes.
     const failuresByFile = new Map<string, number>();
@@ -1909,6 +1943,31 @@ export default Plugin.define({
     await ctx.session.hook("context", async (event) => {
       const messages = event.messages || [];
       if (messages.length < 1) return;
+
+      const promptKey = latestUserPromptKey(messages);
+      const previousTools = availableToolsBySession.get(event.sessionID);
+      const previousOverride = exposeAllToolsBySession.get(event.sessionID);
+      if (
+        promptKey &&
+        ((previousTools && previousTools.promptKey !== promptKey) || (previousOverride && previousOverride !== promptKey))
+      ) {
+        availableToolsBySession.delete(event.sessionID);
+        exposeAllToolsBySession.delete(event.sessionID);
+      }
+      const forceAllTools = Boolean(promptKey && exposeAllToolsBySession.get(event.sessionID) === promptKey);
+      if (promptKey && event.tools && !forceAllTools) {
+        const currentSnapshot = availableToolsBySession.get(event.sessionID);
+        availableToolsBySession.set(event.sessionID, {
+          promptKey,
+          // Union within the same request so a reused event.tools object cannot
+          // make an earlier auto-filter permanently lose tool definitions.
+          tools: {
+            ...(currentSnapshot?.promptKey === promptKey ? currentSnapshot.tools : {}),
+            ...event.tools,
+          },
+        });
+      }
+      const availableTools = availableToolsBySession.get(event.sessionID);
 
       // ---- COMPLEXITY CLASSIFICATION (shared by compaction + parameter modulation) ----
       // Classified once per request. It sizes the compaction keep window and drives
@@ -2042,7 +2101,12 @@ export default Plugin.define({
       // classifier error and never drops the always-keep core or a tool the model
       // has already used this session. Runs last so it always has the final word
       // on event.tools for this request.
-      await applyToolExposure(config, event);
+      await applyToolExposure(
+        config,
+        event,
+        forceAllTools,
+        availableTools?.promptKey === promptKey ? availableTools.tools : undefined,
+      );
     });
 
     // ==========================================
@@ -2194,6 +2258,50 @@ export default Plugin.define({
     });
 
     // ==========================================
+    // TOOL: RECOVER THE FULL TOOL SET FOR THIS USER REQUEST
+    // ==========================================
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: TOOL_EXPOSURE_TOOL,
+        description:
+          "Recovery path when reflex_run did not produce the needed result or you need a different direct tool. Lists the tools available to this agent and restores all their tool schemas for the rest of this user request. This tool does not execute another tool; choose one from the returned inventory and call it directly.",
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        execute: async (_input: any, context: any) => {
+          const sessionID = String(context?.sessionID ?? "");
+          if (!sessionID) {
+            return { content: `[${TOOL_EXPOSURE_TOOL}] Cannot identify the current session; automatic tool exposure was not changed.` };
+          }
+
+          const snapshot = availableToolsBySession.get(sessionID);
+          if (!snapshot) {
+            return { content: `[${TOOL_EXPOSURE_TOOL}] No tool snapshot was captured for this user request, so I could not restore the request's original tool set.` };
+          }
+
+          exposeAllToolsBySession.set(sessionID, snapshot.promptKey);
+          const inventory = Object.entries(snapshot.tools)
+            .map(([name, value]) => {
+              const description = String((value as any)?.description ?? "").replace(/\s+/g, " ").trim();
+              const summary = description.length > 240 ? `${description.slice(0, 237)}...` : description;
+              return `- \`${name}\`${summary ? `: ${summary}` : ""}`;
+            })
+            .join("\n");
+
+          console.log(`[System One Tools]: Full tool exposure requested for session ${sessionID}.`);
+          return {
+            content:
+              `[${TOOL_EXPOSURE_TOOL}] Restored all ${Object.keys(snapshot.tools).length} tools for the rest of this user request. ` +
+              `Their complete schemas will be included on the next model turn. No tool was executed. Choose a tool from this inventory and call it directly; automatic filtering resumes on the next user request.\n\n` +
+              (inventory || "(No tools were available in the captured request.)"),
+          };
+        },
+      });
+    });
+
+    // ==========================================
     // reflex_run: DECISION-MODEL TOOL DISPATCH (OPTIONAL FALLBACK)
     // A fallback the model reaches for ONLY when it cannot decide which underlying
     // tool to call for a task. It is not the default path — the model calls the real
@@ -2237,7 +2345,7 @@ export default Plugin.define({
           // Pool-driven: read the REAL registered tool pool and dispatch from it —
           // no hardcoded tool catalog or guessed arg shapes. Meta-tools (reflex_run
           // itself and the Code Mode infrastructure) are not dispatch targets.
-          const META = new Set(["reflex_run", "execute", "search", "skill", "question", "subagent"]);
+          const META = new Set(["reflex_run", TOOL_EXPOSURE_TOOL, "execute", "search", "skill", "question", "subagent"]);
           let registered: any[] = [];
           try {
             registered = [...(await ctx.tool.list())];
