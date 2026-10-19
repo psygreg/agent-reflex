@@ -106,10 +106,10 @@ function hasUserEffortOverride(model: any, options: any): boolean {
 //
 // Keep-window (most recent messages always kept verbatim) per complexity level.
 // High-complexity work has the most moving parts, so it keeps the most context.
-const COMPACT_KEEP_RECENT: Record<EffortLevel, number> = { simple: 6, medium: 10, high: 14 };
+const COMPACT_KEEP_RECENT: Record<EffortLevel, number> = { simple: 10, medium: 24, high: 48 };
 
 // Trigger only when the history is meaningfully longer than the keep window.
-const COMPACT_MIN_MESSAGES = 18;
+const COMPACT_MIN_MESSAGES = 60;
 
 // Relevance floor for keeping an older message verbatim. Above this the message
 // is preserved in full; at or below it the message is folded into the digest.
@@ -119,7 +119,7 @@ const COMPACT_RELEVANCE_KEEP = 0.65;
 
 // Bound on how many older messages are kept verbatim for relevance, so a long
 // session cannot preserve its whole tail and defeat the compaction.
-const COMPACT_MAX_PRESERVED = 8;
+const COMPACT_MAX_PRESERVED = 10;
 
 // The structured digest buckets: the recurring kinds of fact a coding session
 // establishes and later work depends on. Each bucket carries theme keywords used
