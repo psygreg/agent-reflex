@@ -2105,10 +2105,15 @@ export default Plugin.define({
       const userMessage = latestUserMessage(messages);
       const userPrompt0 = contentToText(userMessage?.content);
       let decisionCache = promptKey ? requestDecisionsBySession.get(event.sessionID) : undefined;
+      // True exactly for the first model call of a user request. Compaction and
+      // history scoring are request-level decisions, so they only run here; tool
+      // continuations keep the already-compacted request untouched.
+      let isNewUserRequest = false;
       if (promptKey && (!decisionCache || decisionCache.promptKey !== promptKey)) {
         if (decisionCache) levelBySession.delete(event.sessionID);
         decisionCache = createRequestDecisionCache(promptKey);
         requestDecisionsBySession.set(event.sessionID, decisionCache);
+        isNewUserRequest = true;
       }
       if (!decisionCache) decisionCache = createRequestDecisionCache(promptKey);
 
@@ -2172,9 +2177,12 @@ export default Plugin.define({
           `Would the "${name}" tool be needed to fully answer this user request? Answer YES only if this specific tool is likely required.`,
         );
       }
-      const historyToScore = messages.length > COMPACT_MIN_MESSAGES
-        ? messages.slice(0, -COMPACT_KEEP_RECENT.simple)
-        : [];
+      // History messages are scored once per user request, right before the
+      // compaction decision is made; tool-loop continuations skip it entirely.
+      const historyToScore =
+        isNewUserRequest && messages.length > COMPACT_MIN_MESSAGES
+          ? messages.slice(0, -COMPACT_KEEP_RECENT.simple)
+          : [];
       for (const msg of historyToScore) {
         const key = historyMessageKey(msg);
         if (decisionCache.historyScores.has(key)) continue;
@@ -2232,7 +2240,10 @@ export default Plugin.define({
       // keeps a bounded set of high-relevance older messages verbatim, and folds
       // the remaining older messages into one structured digest so their detail is
       // compressed rather than discarded.
-      if (messages.length > COMPACT_MIN_MESSAGES) {
+      // Compaction may only happen on the first model call of a user request:
+      // tool continuations receive the already-compacted list and must pass it
+      // through untouched, or each tool round would re-fold and re-digest it.
+      if (isNewUserRequest && messages.length > COMPACT_MIN_MESSAGES) {
         const keepRecent = COMPACT_KEEP_RECENT[level];
         const distantPast = messages.slice(0, -keepRecent);
         const recentPast = messages.slice(-keepRecent);
