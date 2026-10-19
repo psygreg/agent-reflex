@@ -1246,8 +1246,21 @@ async function buildHistoryDigest(config: SystemOneConfig, tailText: string): Pr
 // invoked this session is also kept, so a multi-step task never loses a tool
 // mid-flight. reflex_run is likewise never removed (it is the optional fallback
 // dispatch path), so the model can always reach for it when it cannot decide which
-// tool to call.
-const TOOL_CORE = new Set(["read", "grep", "glob", "edit", "write", "bash", "shell", "task", "reflex_run"]);
+// tool to call. The confidence tool is kept too: the context hook may explicitly
+// instruct the model to call it, while tool relevance scoring only sees the user
+// prompt and could otherwise remove it as irrelevant.
+const TOOL_CORE = new Set([
+  "read",
+  "grep",
+  "glob",
+  "edit",
+  "write",
+  "bash",
+  "shell",
+  "task",
+  "reflex_run",
+  CONFIDENCE_TOOL,
+]);
 
 // Fallback tiers used when the per-tool batch is not supported by the classifier
 // backend (it only answers one question). Each tier is the set of tool-name

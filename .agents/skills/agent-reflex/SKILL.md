@@ -71,10 +71,11 @@ capability below is driven by this classifier.
 - **Tool exposure**: for each prompt the classifier decides which tools the
   task needs and the model is given only those, so the request carries fewer
   tool schemas and saves input tokens. The always-keep set is the common core
-  (read/search/edit/shell/task) plus `reflex_run`, so the model keeps its direct
-  tools and only the long tail (web, exec, subagents…) is trimmed to what the
-  task clearly needs or the model already used this session. Everything is
-  exposed if the classifier is unavailable.
+  (read/search/edit/shell/task) plus `reflex_run` and
+  `systemone_check_confidence`, so the model can always follow the confidence
+  guidance on complex tasks. Only the long tail (web, exec, subagents…) is
+  trimmed to what the task clearly needs or the model already used this session.
+  Everything is exposed if the classifier is unavailable.
 - **Tool dispatch** (`reflex_run`): an optional fallback tool for when the model
   cannot decide which underlying tool a task needs. It asks the decision model
   which tool to use (a `choice` decision), runs it, and returns its real output.
