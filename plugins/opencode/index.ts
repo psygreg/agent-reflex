@@ -2253,6 +2253,14 @@ export default Plugin.define({
     const dynamicEffortBySession = new Map<string, boolean>();
     const requestDecisionsBySession = new Map<string, RequestDecisionCache>();
     const historyDigestBySession = new Map<string, { tailText: string; lines: string[] }>();
+    // History relevance verdicts persist across user requests within the session:
+    // the load-bearing question about an old message does not depend on the current
+    // prompt, so re-asking the whole history on every new prompt would spend the
+    // bulk of the compaction budget repeating answers it already had. Verdicts are
+    // cached by message identity (historyMessageKey) and only numeric answers are
+    // cached — a null (classifier unavailable) stays uncached so it is retried on
+    // the next user request instead of pinning fail-open "preserve" for the session.
+    const historyScoresBySession = new Map<string, Map<string, number | null>>();
     // Snapshot the unfiltered tool map per user request so the recovery tool can
     // restore tools removed by auto exposure on the next model call.
     const availableToolsBySession = new Map<string, { promptKey: string; tools: Record<string, unknown> }>();
@@ -2301,6 +2309,15 @@ export default Plugin.define({
         isNewUserRequest = true;
       }
       if (!decisionCache) decisionCache = createRequestDecisionCache(promptKey);
+
+      // History scores point at the session-wide cache, so verdicts survive past
+      // this user request and only uncached messages are sent to the classifier.
+      let sharedHistoryScores = historyScoresBySession.get(event.sessionID);
+      if (!sharedHistoryScores) {
+        sharedHistoryScores = new Map<string, number | null>();
+        historyScoresBySession.set(event.sessionID, sharedHistoryScores);
+      }
+      decisionCache.historyScores = sharedHistoryScores;
 
       // ---- LOOP GUARD (stuck-loop detection) ----
       // A guard verdict is decided incrementally in the execute.after hook as
@@ -2362,7 +2379,9 @@ export default Plugin.define({
 
       // Complexity, tool exposure and any uncached history scores are all
       // decisions about this request, so put them in one typed System One batch.
-      // The results are cached by user-message ID and reused across tool turns.
+      // Complexity and tool relevance are cached per user request; history
+      // verdicts are cached per message identity for the whole session, so only
+      // messages that have never been judged reach the classifier here.
       const exposurePlan = planToolExposure(config, event, forceAllTools, userPrompt0);
       const questionsById: Record<string, string> = {};
       const questionTargets = new Map<string, { kind: "complexity" | "tool" | "history"; name?: string; key?: string }>();
@@ -2395,8 +2414,11 @@ export default Plugin.define({
           `Would the "${name}" tool be needed to fully answer this user request? Answer YES only if this specific tool is likely required.`,
         );
       }
-      // History messages are scored once per user request, right before the
-      // compaction decision is made; tool-loop continuations skip it entirely.
+      // History messages are scored on the first model call of a user request,
+      // right before the compaction decision is made; tool-loop continuations
+      // skip it entirely. Verdicts persist across user requests (one judgement
+      // per message per session), so a long session asks for only the handful of
+      // messages that aged into the scoring window since the last request.
       const historyToScore =
         isNewUserRequest && messages.length > COMPACT_MIN_MESSAGES
           ? messages.slice(0, -COMPACT_KEEP_RECENT.simple)
@@ -2430,7 +2452,10 @@ export default Plugin.define({
           } else if (target.kind === "tool" && target.name) {
             if (typeof score === "number") decisionCache.toolScoresByName[target.name] = score;
           } else if (target.kind === "history" && target.key) {
-            decisionCache.historyScores.set(target.key, typeof score === "number" ? score : null);
+            // Cache only numeric verdicts. A null (classifier unavailable) stays
+            // uncached so the next user request re-asks it; caching nulls would
+            // pin fail-open "preserve" for the rest of the session.
+            if (typeof score === "number") decisionCache.historyScores.set(target.key, score);
           }
         }
       }
