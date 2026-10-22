@@ -464,12 +464,15 @@ case "$provider" in
     ;;
 esac
 
-model_default="${PRESET_MODEL[$provider]}"
+# The custom provider has no preset entries, so both keys are read with a
+# default — an unset associative-array key aborts the script under set -u.
+model_default="${PRESET_MODEL[$provider]-}"
+model_hint="${PRESET_HINT[$provider]-the model id served by the endpoint}"
 if [ -n "$model_default" ]; then
   ask model "${BOLD}Classifier model${RESET} ${DIM}[${model_default}]${RESET}: " "$model_default"
 else
   while :; do
-    ask model "${BOLD}Classifier model${RESET} ${DIM}(${PRESET_HINT[$provider]})${RESET}: "
+    ask model "${BOLD}Classifier model${RESET} ${DIM}(${model_hint})${RESET}: "
     [ -n "$model" ] && break
     err "The classifier model is required."
   done
