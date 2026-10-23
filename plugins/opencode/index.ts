@@ -965,6 +965,17 @@ interface SystemOneConfig {
   loopDetection: "auto" | "off";
 }
 
+// Resolves an {env:NAME} placeholder to the environment value. Matches the
+// resolveEnv helper in the mimocode/pi ports and ar_resolve_env in the shell
+// ports, so every agent resolves the same config string the same way.
+function resolveEnv(value: string | undefined): string | undefined {
+  if (typeof value === "string") {
+    const m = /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value);
+    if (m) return process.env[m[1]] ?? "";
+  }
+  return value;
+}
+
 function resolveConfig(options: Record<string, unknown>): SystemOneConfig | null {
   const provider = (options.provider as ProviderPreset | undefined) ?? "custom";
   const baseURL = (options.baseURL as string | undefined) ?? PRESET_BASE_URLS[provider];
@@ -977,7 +988,7 @@ function resolveConfig(options: Record<string, unknown>): SystemOneConfig | null
     baseURL: baseURL.replace(/\/+$/, ""),
     model,
     fallbackModel: typeof options.fallbackModel === "string" ? options.fallbackModel : undefined,
-    apiKey: options.apiKey as string | undefined,
+    apiKey: resolveEnv(options.apiKey as string | undefined) || undefined,
     debugLog: typeof options.debugLog === "string" ? options.debugLog : undefined,
     toolExposure: toolsOpt === "auto" ? "auto" : "all",
     loopDetection: loopOpt === "off" ? "off" : LOOP_DETECTION_DEFAULT,
