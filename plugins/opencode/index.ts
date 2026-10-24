@@ -48,11 +48,14 @@ const LEVEL_REQUEST = {
 
 type EffortLevel = keyof typeof LEVEL_REQUEST;
 
-// Complexity score cut-offs: above 0.50 is medium, above 0.80 is high.
+// Complexity score cut-offs: below 0.40 is simple, above 0.70 is high, anything
+// in between (cut-offs included) is medium. The cut-offs sit low on purpose: the
+// classifier tends to undershoot on real coding work, so medium is the default
+// guess and only a clearly trivial request gets the simple treatment.
 function classifyComplexity(score: number): EffortLevel {
-  if (score > 0.80) return "high";
-  if (score > 0.50) return "medium";
-  return "simple";
+  if (score > 0.70) return "high";
+  if (score < 0.40) return "simple";
+  return "medium";
 }
 
 function isExplicitEffortValue(value: unknown): boolean {
@@ -1072,7 +1075,7 @@ async function askSystemOne(config: SystemOneConfig, state: string, question: st
   return null;
 }
 
-// Batched System One query: one request carrying a question per tool id, so a
+// Batched System One query: one request carrying a question per decision id, so a
 // whole tool set is scored in a single round-trip. The request shape is the same
 // System One wire format as askSystemOne (model, state, questions) but with a key
 // per tool; the response is read per key (answers.<id>.noul). Returns a map of
@@ -1397,14 +1400,18 @@ async function buildHistoryDigest(config: SystemOneConfig, tailText: string): Pr
 // from the outgoing request.
 //
 // Always-keep core: these are never removed regardless of the classifier, so the
-// model can always find/read/search/edit/shell out. Anything the model has already
-// invoked this session is also kept, so a multi-step task never loses a tool
-// mid-flight. reflex_run is likewise never removed (it is the optional fallback
-// dispatch path), so the model can always reach for it when it cannot decide which
-// tool to call. The confidence tool is kept too: the context hook may explicitly
-// instruct the model to call it, while tool relevance scoring only sees the user
-// prompt and could otherwise remove it as irrelevant. The tool-exposure recovery
-// tool is also core so it can restore the tools removed by this hook.
+// model can always find/read/search/edit/shell out. The Code Mode meta-tools
+// (execute, search, skill, question) belong here too: they are harness
+// infrastructure the model calls EVERYTHING through, so dropping one does not
+// trim the request — it strands the whole tool surface. Anything the model has
+// already invoked this session is also kept, so a multi-step task never loses a
+// tool mid-flight. reflex_run is likewise never removed (it is the optional
+// fallback dispatch path), so the model can always reach for it when it cannot
+// decide which tool to call. The confidence tool is kept too: the context hook
+// may explicitly instruct the model to call it, while tool relevance scoring only
+// sees the user prompt and could otherwise remove it as irrelevant. The
+// tool-exposure recovery tool is also core so it can restore the tools removed by
+// this hook.
 const TOOL_CORE = new Set([
   "read",
   "grep",
@@ -1414,28 +1421,74 @@ const TOOL_CORE = new Set([
   "bash",
   "shell",
   "task",
+  "execute",
+  "search",
+  "skill",
+  "question",
   "reflex_run",
   CONFIDENCE_TOOL,
   TOOL_EXPOSURE_TOOL,
 ]);
 
-// Fallback tiers used when the per-tool batch is not supported by the classifier
-// backend (it only answers one question). Each tier is the set of tool-name
-// prefixes that stay exposed; everything else is dropped. Ordered narrow -> wide.
-const TOOL_TIERS: Array<{ match: (name: string) => boolean }> = [
-  // READ: inspect/search only.
-  { match: (n) => /^(read|grep|glob|ls|list|find)$/.test(n) || /_?(read|search|find|list|grep|glob)$/.test(n) },
-  // EDIT: read + modify files (adds write/edit/patch-style tools, no shell).
-  { match: (n) => /^(read|grep|glob|ls|list|find|edit|write|patch|multiedit)$/.test(n) || /_?(edit|write|patch)$/.test(n) },
-  // FULL: everything (shell, web, task, subagents, etc.).
-  { match: () => true },
+// Tool exposure judges PURPOSE GROUPS, not individual tools: one decision
+// question per group ("is this kind of tool needed at all?") and the verdict
+// applies to every tool in it. That is both a better question for the classifier
+// and the compensation for it underscoring individual tools — a group that stays
+// keeps its whole family, so one low per-tool score can no longer strand the
+// model without a tool it needs.
+interface ToolGroup {
+  id: string;
+  purpose: string;
+  match: (name: string) => boolean;
+}
+
+// First match wins, so the specific families come before the generic ones (a
+// webfetch must land in "web", never in "read"). The last group is the catch-all:
+// unclassified tools are judged as "other", never silently kept or dropped.
+const TOOL_GROUPS: ToolGroup[] = [
+  // WEB: reaching the network.
+  { id: "web", purpose: "reaching the web: fetching URLs, web search", match: (n) => /^(web|fetch|browse|http|url)/.test(n) || /_(web|fetch|browse|url|http)$/.test(n) },
+  // SHELL: running commands or external processes.
+  { id: "shell", purpose: "running shell commands or external processes", match: (n) => /^(bash|shell|exec|terminal|run|command|powershell|cmd)/.test(n) || /_(exec|run|command|shell|terminal)$/.test(n) },
+  // EDIT: creating or modifying files.
+  { id: "edit", purpose: "creating or modifying files", match: (n) => /^(edit|write|patch|multiedit|create|replace)/.test(n) || /_(edit|write|patch|create|replace)$/.test(n) },
+  // READ: inspecting files and the repo.
+  { id: "read", purpose: "reading, listing and searching files", match: (n) => /^(read|grep|glob|ls|list|find|cat|search|lookup|query)/.test(n) || /_(read|search|find|list|grep|glob|lookup|query|cat)$/.test(n) },
+  // AGENTS: delegation and prompting.
+  { id: "agents", purpose: "delegating work to subagents, skills or prompts", match: (n) => /^(task|subagent|delegate|skill|question|agent|workflow)/.test(n) || /_(task|agent|delegate|skill|question)$/.test(n) },
+  // OTHER: the long tail of specialized helpers.
+  { id: "other", purpose: "other specialized helper tools", match: () => true },
 ];
 
-// Picking a tier from one scalar relevance score: low -> READ, mid -> EDIT, high -> FULL.
-function tierForScore(score: number): number {
-  if (score <= 0.33) return 0;
-  if (score <= 0.66) return 1;
-  return 2;
+function toolGroupOf(name: string): ToolGroup {
+  return TOOL_GROUPS.find((group) => group.match(name)) ?? TOOL_GROUPS[TOOL_GROUPS.length - 1];
+}
+
+// Groups candidate tools by purpose, preserving name order within each group.
+function groupCandidates(candidates: string[]): Map<ToolGroup, string[]> {
+  const byGroup = new Map<ToolGroup, string[]>();
+  for (const name of candidates) {
+    const group = toolGroupOf(name);
+    const names = byGroup.get(group) ?? [];
+    names.push(name);
+    byGroup.set(group, names);
+  }
+  return byGroup;
+}
+
+// Fallback tiers used when the batched group questions are not supported by the
+// classifier backend (it only answers one question). Each tier is a cumulative
+// set of group ids that stays exposed; everything outside it is dropped. Ordered
+// narrow -> wide: simple -> READ, medium -> EDIT, high -> FULL (every group),
+// using the same complexity cut-offs as the effort level.
+const TOOL_TIERS: Record<EffortLevel, Set<string> | null> = {
+  simple: new Set(["read"]),
+  medium: new Set(["read", "edit"]),
+  high: null,
+};
+
+function tierForScore(score: number): Set<string> | null {
+  return TOOL_TIERS[classifyComplexity(score)];
 }
 
 // Renders a nested tool result into plain text the model can read. OpenCode tool
@@ -2040,9 +2093,11 @@ async function checkLoopAndBuildWarning(
 }
 
 // Applies precomputed request-level decisions to the mutable tool map. The
-// per-tool scores are sent in the same batch as complexity and compaction scores;
+// group scores are sent in the same batch as complexity and compaction scores;
 // a single scalar tier fallback is used only if the backend answered none of them.
-const TOOL_RELEVANCE_THRESHOLD = 0.35;
+// A tool is dropped only when its whole GROUP scored below the threshold: the
+// classifier judges "is this kind of tool needed", not each tool on its own.
+const TOOL_GROUP_THRESHOLD = 0.35;
 
 interface ToolExposurePlan {
   allNames: string[];
@@ -2053,8 +2108,8 @@ interface RequestDecisionCache {
   promptKey: string;
   complexityResolved: boolean;
   complexityScore: number | null;
-  toolAttempted: Set<string>;
-  toolScoresByName: Record<string, number>;
+  toolGroupAttempted: Set<string>;
+  toolGroupScores: Record<string, number>;
   toolTierResolved: boolean;
   toolTierScore: number | null;
   historyScores: Map<string, number | null>;
@@ -2065,8 +2120,8 @@ function createRequestDecisionCache(promptKey: string): RequestDecisionCache {
     promptKey,
     complexityResolved: false,
     complexityScore: null,
-    toolAttempted: new Set(),
-    toolScoresByName: {},
+    toolGroupAttempted: new Set(),
+    toolGroupScores: {},
     toolTierResolved: false,
     toolTierScore: null,
     historyScores: new Map(),
@@ -2102,7 +2157,7 @@ function applyToolExposure(
   forceAll = false,
   availableTools?: Record<string, unknown>,
   plan: ToolExposurePlan | null = null,
-  scoresByName: Record<string, number> = {},
+  groupScores: Record<string, number> = {},
   tierScore: number | null = null,
 ): void {
   if (config.toolExposure !== "auto") return;
@@ -2122,26 +2177,28 @@ function applyToolExposure(
 
   if (!plan) return;
   const candidates = plan.candidates.filter((name) => name in tools);
-  const answered = candidates.filter((name) => typeof scoresByName[name] === "number");
+  const answered = candidates.filter((name) => typeof groupScores[toolGroupOf(name).id] === "number");
   if (answered.length > 0) {
     for (const name of candidates) {
-      const score = scoresByName[name];
-      // Drop only tools the backend explicitly deemed irrelevant. A candidate
-      // the backend did not answer is kept (fail-open per tool).
-      if (typeof score === "number" && score < TOOL_RELEVANCE_THRESHOLD) delete tools[name];
+      const score = groupScores[toolGroupOf(name).id];
+      // Drop only tools whose GROUP the backend explicitly deemed irrelevant. A
+      // group the backend did not answer is kept (fail-open per group), and every
+      // tool of a kept group stays exposed — the verdict is about the purpose,
+      // not about each tool name.
+      if (typeof score === "number" && score < TOOL_GROUP_THRESHOLD) delete tools[name];
     }
-    console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${plan.allNames.length} tools (per-tool scoring).`);
+    console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${plan.allNames.length} tools (group scoring).`);
     return;
   }
 
-  // When the batched request returned no per-tool answers, the context hook has
+  // When the batched request returned no group answers, the context hook has
   // already asked the scalar tier fallback and cached its answer for this prompt.
   if (tierScore !== null) {
-    const tier = TOOL_TIERS[tierForScore(tierScore)];
+    const tier = tierForScore(tierScore);
     for (const name of candidates) {
-      if (!tier.match(name)) delete tools[name];
+      if (tier && !tier.has(toolGroupOf(name).id)) delete tools[name];
     }
-    console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${plan.allNames.length} tools (tier ${tierForScore(tierScore)}).`);
+    console.log(`[System One Tools]: Exposed ${Object.keys(tools).length}/${plan.allNames.length} tools (tier ${classifyComplexity(tierScore)}).`);
   }
 }
 
@@ -2388,17 +2445,17 @@ export default Plugin.define({
       }
       const availableTools = availableToolsBySession.get(event.sessionID);
 
-      // Complexity, tool exposure and any uncached history scores are all
+      // Complexity, tool-group exposure and any uncached history scores are all
       // decisions about this request, so put them in one typed System One batch.
-      // Complexity and tool relevance are cached per user request; history
+      // Complexity and tool-group relevance are cached per user request; history
       // verdicts are cached per message identity for the whole session, so only
       // messages that have never been judged reach the classifier here.
       const exposurePlan = planToolExposure(config, event, forceAllTools, userPrompt0);
       const questionsById: Record<string, string> = {};
-      const questionTargets = new Map<string, { kind: "complexity" | "tool" | "history"; name?: string; key?: string }>();
+      const questionTargets = new Map<string, { kind: "complexity" | "toolgroup" | "history"; group?: string; key?: string }>();
       let decisionQuestionNumber = 0;
       const addDecisionQuestion = (
-        target: { kind: "complexity" | "tool" | "history"; name?: string; key?: string },
+        target: { kind: "complexity" | "toolgroup" | "history"; group?: string; key?: string },
         instructions: string,
       ) => {
         const id = `decision_${decisionQuestionNumber++}`;
@@ -2417,12 +2474,16 @@ export default Plugin.define({
         }
       }
 
-      for (const name of exposurePlan?.candidates ?? []) {
-        if (decisionCache.toolAttempted.has(name)) continue;
-        decisionCache.toolAttempted.add(name);
+      // Tool exposure is judged per PURPOSE GROUP, not per tool: one question per
+      // group ("is this kind of tool needed at all?") and the verdict keeps or
+      // drops the whole family. Fewer questions, and the classifier is not asked
+      // to score tool names it can barely tell apart.
+      for (const [group, names] of groupCandidates(exposurePlan?.candidates ?? [])) {
+        if (decisionCache.toolGroupAttempted.has(group.id)) continue;
+        decisionCache.toolGroupAttempted.add(group.id);
         addDecisionQuestion(
-          { kind: "tool", name },
-          `Would the "${name}" tool be needed to fully answer this user request? Answer YES only if this specific tool is likely required.`,
+          { kind: "toolgroup", group: group.id },
+          `Would any "${group.id}" tool be needed to fully answer this user request? They cover ${group.purpose}. Candidates: ${names.slice(0, 8).join(", ")}. Answer YES only if this tool group is likely required.`,
         );
       }
       // History messages are scored on the first model call of a user request,
@@ -2460,8 +2521,8 @@ export default Plugin.define({
           if (target.kind === "complexity") {
             decisionCache.complexityResolved = true;
             decisionCache.complexityScore = typeof score === "number" ? score : null;
-          } else if (target.kind === "tool" && target.name) {
-            if (typeof score === "number") decisionCache.toolScoresByName[target.name] = score;
+          } else if (target.kind === "toolgroup" && target.group) {
+            if (typeof score === "number") decisionCache.toolGroupScores[target.group] = score;
           } else if (target.kind === "history" && target.key) {
             // Cache only numeric verdicts. A null (classifier unavailable) stays
             // uncached so the next user request re-asks it; caching nulls would
@@ -2472,11 +2533,11 @@ export default Plugin.define({
       }
 
       const toolCandidates = exposurePlan?.candidates ?? [];
-      const hasPerToolAnswer = toolCandidates.some((name) => typeof decisionCache.toolScoresByName[name] === "number");
-      if (hasPerToolAnswer) {
+      const hasPerGroupAnswer = toolCandidates.some((name) => typeof decisionCache.toolGroupScores[toolGroupOf(name).id] === "number");
+      if (hasPerGroupAnswer) {
         decisionCache.toolTierResolved = true;
       }
-      if (toolCandidates.length > 0 && !hasPerToolAnswer && !decisionCache.toolTierResolved) {
+      if (toolCandidates.length > 0 && !hasPerGroupAnswer && !decisionCache.toolTierResolved) {
         decisionCache.toolTierScore = await askSystemOne(
           config,
           `User request: ${userPrompt0.trim()}`,
@@ -2594,8 +2655,8 @@ export default Plugin.define({
       }
 
       // ---- SUB-ROUTINE C: TOOL EXPOSURE (only the tools this task needs) ----
-      // Drops tools whose schemas cannot help this request, so the model's input
-      // carries fewer tool definitions. Fails open (keeps every tool) on any
+      // Drops tool groups whose purpose cannot help this request, so the model's
+      // input carries fewer tool definitions. Fails open (keeps every tool) on any
       // classifier error and never drops the always-keep core or a tool the model
       // has already used this session. Runs last so it always has the final word
       // on event.tools for this request.
@@ -2605,7 +2666,7 @@ export default Plugin.define({
         forceAllTools,
         availableTools?.promptKey === promptKey ? availableTools.tools : undefined,
         exposurePlan,
-        decisionCache.toolScoresByName,
+        decisionCache.toolGroupScores,
         decisionCache.toolTierScore,
       );
     });

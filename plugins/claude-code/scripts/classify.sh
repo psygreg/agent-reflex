@@ -20,7 +20,7 @@ SESSION="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
 
 # classify_complexity SCORE -> simple|medium|high (cut-offs match the plugin).
 classify_level() {
-  awk -v s="$1" 'BEGIN{ if(s>0.80) print "high"; else if(s>0.50) print "medium"; else print "simple" }'
+  awk -v s="$1" 'BEGIN{ if(s>0.70) print "high"; else if(s<0.40) print "simple"; else print "medium" }'
 }
 
 STATE="User prompt: ${PROMPT}"

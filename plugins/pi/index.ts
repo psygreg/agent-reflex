@@ -124,37 +124,78 @@ const LEVEL_MAX_TOKENS: Record<string, number> = { simple: 8192, medium: 65536, 
 // the model can reach for it when it cannot decide which tool to call — it is not
 // relied on as the default path.
 const TOOL_EXPOSURE_ENABLED = (process.env.AGENT_REFLEX_TOOLS ?? "auto") === "auto";
-const TOOL_RELEVANCE_THRESHOLD = 0.35;
+const TOOL_GROUP_THRESHOLD = 0.35;
 
 // Always-keep core: the common direct tools (find/read/search/edit/shell/task) are
 // never removed, so the model always has the tools it reaches for most. reflex_run
 // is kept as the optional fallback dispatch path and is never removed either.
 const TOOL_CORE = new Set(["read", "grep", "glob", "edit", "write", "bash", "shell", "task", "reflex_run"]);
 
-// Fallback tiers when the per-tool batch is unsupported (backend answers one
-// question). Each tier is a matcher over the tool name; everything outside it is
-// removed. Ordered narrow -> wide. FULL keeps everything (the long tail is not
-// assumed reachable via reflex_run).
-const TOOL_TIERS: Array<(name: string) => boolean> = [
-  // READ: inspect/search only.
-  (n) => /^(read|grep|glob|ls|list|find)$/.test(n) || /_?(read|search|find|list|grep|glob)$/.test(n),
-  // EDIT: read + modify files (adds write/edit/patch-style tools, no shell).
-  (n) => /^(read|grep|glob|ls|list|find|edit|write|patch|multiedit)$/.test(n) || /_?(edit|write|patch)$/.test(n),
-  // FULL: everything (shell, web, task, subagents, etc.).
-  () => true,
+// Tool exposure judges PURPOSE GROUPS, not individual tools (mirrors the OpenCode
+// plugin): one decision question per group ("is this kind of tool needed at
+// all?") and the verdict applies to every tool in it. That is both a better
+// question for the classifier and the compensation for it underscoring individual
+// tools — a group that stays keeps its whole family.
+interface ToolGroup {
+  id: string;
+  purpose: string;
+  match: (name: string) => boolean;
+}
+
+// First match wins, so the specific families come before the generic ones (a
+// webfetch must land in "web", never in "read"). The last group is the catch-all:
+// unclassified tools are judged as "other", never silently kept or dropped.
+const TOOL_GROUPS: ToolGroup[] = [
+  // WEB: reaching the network.
+  { id: "web", purpose: "reaching the web: fetching URLs, web search", match: (n) => /^(web|fetch|browse|http|url)/.test(n) || /_(web|fetch|browse|url|http)$/.test(n) },
+  // SHELL: running commands or external processes.
+  { id: "shell", purpose: "running shell commands or external processes", match: (n) => /^(bash|shell|exec|terminal|run|command|powershell|cmd)/.test(n) || /_(exec|run|command|shell|terminal)$/.test(n) },
+  // EDIT: creating or modifying files.
+  { id: "edit", purpose: "creating or modifying files", match: (n) => /^(edit|write|patch|multiedit|create|replace)/.test(n) || /_(edit|write|patch|create|replace)$/.test(n) },
+  // READ: inspecting files and the repo.
+  { id: "read", purpose: "reading, listing and searching files", match: (n) => /^(read|grep|glob|ls|list|find|cat|search|lookup|query)/.test(n) || /_(read|search|find|list|grep|glob|lookup|query|cat)$/.test(n) },
+  // AGENTS: delegation and prompting.
+  { id: "agents", purpose: "delegating work to subagents, skills or prompts", match: (n) => /^(task|subagent|delegate|skill|question|agent|workflow)/.test(n) || /_(task|agent|delegate|skill|question)$/.test(n) },
+  // OTHER: the long tail of specialized helpers.
+  { id: "other", purpose: "other specialized helper tools", match: () => true },
 ];
 
-function tierForScore(score: number): number {
-  if (score <= 0.33) return 0;
-  if (score <= 0.66) return 1;
-  return 2;
+function toolGroupOf(name: string): ToolGroup {
+  return TOOL_GROUPS.find((group) => group.match(name)) ?? TOOL_GROUPS[TOOL_GROUPS.length - 1];
+}
+
+// Groups candidate tools by purpose, preserving name order within each group.
+function groupCandidates(candidates: string[]): Map<ToolGroup, string[]> {
+  const byGroup = new Map<ToolGroup, string[]>();
+  for (const name of candidates) {
+    const group = toolGroupOf(name);
+    const names = byGroup.get(group) ?? [];
+    names.push(name);
+    byGroup.set(group, names);
+  }
+  return byGroup;
+}
+
+// Fallback tiers when the batched group questions are unsupported (backend
+// answers one question). Cumulative group-id sets, ordered narrow -> wide:
+// simple -> READ, medium -> EDIT, high -> FULL (every group), using the same
+// complexity cut-offs as the thinking level.
+const TOOL_TIERS: Record<string, Set<string> | null> = {
+  simple: new Set(["read"]),
+  medium: new Set(["read", "edit"]),
+  high: null,
+};
+
+function tierForScore(score: number): Set<string> | null {
+  return TOOL_TIERS[classifyLevel(score)];
 }
 
 // Applies System One tool exposure: narrows the active tool set to what this task
 // needs. Two decision paths (mirrors the OpenCode plugin):
-//  1. Per-tool batch — one arAskMany call scores every candidate tool; those below
-//     TOOL_RELEVANCE_THRESHOLD are dropped. A candidate the backend did not answer
-//     is kept (fail-open per tool).
+//  1. Group batch — one arAskMany call scores every candidate GROUP by purpose;
+//     tools whose group scored below TOOL_GROUP_THRESHOLD are dropped. A group the
+//     backend did not answer is kept (fail-open per group), and a kept group keeps
+//     its whole family of tools.
 //  2. Tier fallback — if the batch returned no answers (single-question backend),
 //     one scalar arAsk call picks a tier (READ/EDIT/FULL) and everything outside it
 //     is dropped.
@@ -182,17 +223,18 @@ async function applyToolExposure(pi: any, prompt: string): Promise<void> {
 
   try {
     const questionsById: Record<string, string> = {};
-    for (const name of candidates) {
-      questionsById[name] = `Would the "${name}" tool be needed to fully answer this user request? Answer YES only if this specific tool is likely required.`;
+    for (const [group, names] of groupCandidates(candidates)) {
+      questionsById[group.id] = `Would any "${group.id}" tool be needed to fully answer this user request? They cover ${group.purpose}. Candidates: ${names.slice(0, 8).join(", ")}. Answer YES only if this tool group is likely required.`;
     }
     const scores = await arAskMany(stateText, questionsById);
 
-    const answered = candidates.filter((name) => typeof scores[name] === "number");
+    const answered = candidates.filter((name) => typeof scores[toolGroupOf(name).id] === "number");
     if (answered.length > 0) {
       for (const name of pool) {
-        const score = scores[name];
-        // Keep core/used tools, tools with no answer, and tools scoring at/above threshold.
-        if (TOOL_CORE.has(name) || state.usedTools.has(name) || typeof score !== "number" || score >= TOOL_RELEVANCE_THRESHOLD) {
+        const score = scores[toolGroupOf(name).id];
+        // Keep core/used tools, tools whose GROUP has no answer, and tools whose
+        // group scored at/above threshold (a kept group keeps its whole family).
+        if (TOOL_CORE.has(name) || state.usedTools.has(name) || typeof score !== "number" || score >= TOOL_GROUP_THRESHOLD) {
           keep.add(name);
         }
       }
@@ -203,9 +245,9 @@ async function applyToolExposure(pi: any, prompt: string): Promise<void> {
         "Does solving this request require running shell commands, editing or writing files, or anything beyond reading and searching? YES means it needs more than read-only tools.",
       );
       if (needScore === null) return; // fail-open: keep all active tools
-      const tier = TOOL_TIERS[tierForScore(needScore)];
+      const tier = tierForScore(needScore);
       for (const name of pool) {
-        if (TOOL_CORE.has(name) || state.usedTools.has(name) || tier(name)) keep.add(name);
+        if (TOOL_CORE.has(name) || state.usedTools.has(name) || (tier && tier.has(toolGroupOf(name).id))) keep.add(name);
       }
     }
 
@@ -215,6 +257,41 @@ async function applyToolExposure(pi: any, prompt: string): Promise<void> {
   } catch (error: any) {
     arLog(`tools: exposure failed (${error?.message ?? error}); keeping all`);
   }
+}
+
+// Tool ids a message links to (the call it makes or the call it answers).
+// Local copy of toolCallLinkIds from plugins/opencode/index.ts: message-level
+// ids (tool_call_id), tool_calls ids, and typed tool_use/tool-call/
+// tool_result/tool-result content-part ids.
+function toolCallLinkIds(msg: any): string[] {
+  const ids: string[] = [];
+  const messageToolId = msg?.tool_call_id ?? msg?.toolCallId ?? msg?.tool_use_id ?? msg?.toolUseId;
+  if (messageToolId) ids.push(String(messageToolId));
+  for (const call of msg?.tool_calls ?? []) {
+    const id = call?.id ?? call?.tool_call_id;
+    if (id) ids.push(String(id));
+  }
+  const parts = Array.isArray(msg?.content) ? msg.content : [];
+  for (const p of parts) {
+    if (!["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type))) continue;
+    const id = p?.id ?? p?.tool_call_id ?? p?.tool_use_id ?? p?.toolCallId ?? p?.toolUseId;
+    if (id) ids.push(String(id));
+  }
+  return ids;
+}
+
+// Index of the message holding the other half of this tool-call pair (the
+// result for a call, or the call for a result), or undefined when there is
+// none. Pairing scans the whole list: compaction can separate a call from its
+// result by unrelated messages, so adjacency is not enough.
+function findPairMemberIndex(msg: any, msgs: any[], self: number): number | undefined {
+  const ids = new Set(toolCallLinkIds(msg));
+  if (ids.size === 0) return undefined;
+  for (let j = 0; j < msgs.length; j++) {
+    if (j === self) continue;
+    if (toolCallLinkIds(msgs[j]).some((id) => ids.has(id))) return j;
+  }
+  return undefined;
 }
 
 function messageToText(msg: any): string {
@@ -512,7 +589,8 @@ export default function (pi: any) {
   // Local copy of the shared pair-closing helper (see plugins/opencode/
   // index.ts, and plugins/mimocode/index.ts, which cannot import helpers):
   // tool-call pairs are atomic, so pruning must never leave an unpaired
-  // tool_use / tool_result.
+  // tool_use / tool_result. findPairMemberIndex links a call and its result by
+  // their shared tool id (msg.tool_call_id / tool_calls / typed content parts).
   function closeToolCallPairs(preservedIdx: Set<number>, distant: any[], recent: any[]): void {
     const pairMembers = [...distant, ...recent];
     for (let round = 0; round < 32; round++) {

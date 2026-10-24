@@ -35,11 +35,12 @@ EDIT_TOOLS = {"patch", "write_file", "edit_file", "edit", "write"}
 # Complexity classification (mirrors classifyComplexity in the OpenCode plugin).
 # ---------------------------------------------------------------------------
 def classify_complexity(score: float) -> str:
-    if score > 0.80:
+    # Cut-offs match the plugin (below 0.40 simple, above 0.70 high).
+    if score > 0.70:
         return "high"
-    if score > 0.50:
-        return "medium"
-    return "simple"
+    if score < 0.40:
+        return "simple"
+    return "medium"
 
 
 def _session_state_dir() -> str:

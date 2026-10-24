@@ -30,7 +30,7 @@ fi
 [ -n "$PROMPT" ] || { echo '{}'; exit 0; }
 
 classify_level() {
-  awk -v s="$1" 'BEGIN{ if(s>0.80) print "high"; else if(s>0.50) print "medium"; else print "simple" }'
+  awk -v s="$1" 'BEGIN{ if(s>0.70) print "high"; else if(s<0.40) print "simple"; else print "medium" }'
 }
 
 STATE="User prompt: ${PROMPT}"

@@ -71,10 +71,12 @@ capability below is driven by this classifier.
   models without a wired dialect stay untouched.
 - **Confidence tool**: the `systemone_check_confidence` tool scores the
   model's current line of thought and returns CONTINUE or RESTART.
-- **Tool exposure**: for each prompt the classifier decides which tools the
-  task needs and the model is given only those, so the request carries fewer
-  tool schemas and saves input tokens. The always-keep set is the common core
-  (read/search/edit/shell/task) plus `reflex_run` and
+- **Tool exposure**: for each prompt the classifier decides which tool *groups*
+  the task needs (tools are judged by purpose — web, shell, edit, read, agents,
+  other — one question per group, not per tool) and the model is given only
+  those, so the request carries fewer tool schemas and saves input tokens; a
+  kept group keeps its whole family of tools. The always-keep set is the common
+  core (read/search/edit/shell/task) plus `reflex_run` and
   `systemone_check_confidence`, so the model can always follow the confidence
   guidance on complex tasks. Only the long tail (web, exec, subagents…) is
   trimmed to what the task clearly needs or the model already used this session.

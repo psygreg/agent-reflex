@@ -534,18 +534,51 @@ make_entry() {
     // each use site shifts it to the depth of its own "plugins" array.
     const entry = JSON.stringify({ package: "./plugins/reflex", options }, null, 2);
     const padLines = (block, pad) => block.split("\n").map((l) => pad + l).join("\n");
+    // Reads the string starting at src[start] (the opening quote) and returns
+    // the index just past its closing quote, honoring escapes.
+    const stringEnd = (src, start) => {
+      let j = start + 1;
+      while (j < src.length && src[j] !== "\"") j += src[j] === "\\" ? 2 : 1;
+      return j + 1;
+    };
     // String- and comment-aware scan of a JSONC source: reports where the last
-    // real character ends (comments and blank space excluded) and which "}"
-    // closes the root object, so neither can be fooled by commas or braces
-    // that only appear inside comments or strings.
+    // real character ends (comments and blank space excluded), which "}" closes
+    // the root object, and where the ROOT-LEVEL "plugins" array lives (key
+    // index, its "[" and the matching "]"), so none of them can be fooled by
+    // brackets, commas or a "plugins" label that only appear inside comments or
+    // strings. A nested "plugins" array (inside a provider block, say) is not
+    // the array the entry belongs to and is ignored.
     const scanJsonc = (src) => {
       let i = 0, lastReal = 0, rootClose = -1, depth = 0;
+      let pluginsKey = -1, pluginsOpen = -1, pluginsClose = -1;
       while (i < src.length) {
         const c = src[i];
         if (c === "\"") {
-          i += 1;
-          while (i < src.length && src[i] !== "\"") i += src[i] === "\\" ? 2 : 1;
-          i += 1;
+          const end = stringEnd(src, i);
+          if (depth === 1 && pluginsOpen === -1 && src.slice(i + 1, end - 1) === "plugins") {
+            let j = end;
+            while (j < src.length && /\s/.test(src[j])) j += 1;
+            if (src[j] === ":") {
+              j += 1;
+              while (j < src.length && /\s/.test(src[j])) j += 1;
+              if (src[j] === "[") {
+                pluginsKey = i;
+                pluginsOpen = j;
+                let k = j + 1, sq = 1;
+                while (k < src.length && sq > 0) {
+                  const d = src[k];
+                  if (d === "\"") { k = stringEnd(src, k); continue; }
+                  if (d === "/" && src[k + 1] === "/") { while (k < src.length && src[k] !== "\n") k += 1; continue; }
+                  if (d === "/" && src[k + 1] === "*") { k += 2; while (k < src.length && !(src[k] === "*" && src[k + 1] === "/")) k += 1; k += 2; continue; }
+                  if (d === "[") sq += 1;
+                  if (d === "]") sq -= 1;
+                  k += 1;
+                }
+                pluginsClose = sq === 0 ? k - 1 : -1;
+              }
+            }
+          }
+          i = end;
           lastReal = i;
           continue;
         }
@@ -557,11 +590,41 @@ make_entry() {
         if (c === "{") depth += 1;
         if (c === "}" && --depth === 0 && rootClose === -1) rootClose = i - 1;
       }
-      return { lastReal, rootClose };
+      return { lastReal, rootClose, pluginsKey, pluginsOpen, pluginsClose };
     };
-    // Moves the root closing brace to a line of its own when it is glued to the
-    // end of the line before it, indenting the new line with `indent`. A brace
-    // that already sits on its own line keeps the indentation it has.
+    // Blanks out comments while keeping every byte position and newline, with
+    // the same string awareness as the scan, so structure tests cannot be
+    // fooled by text that only appears inside a comment.
+    const maskComments = (src) => {
+      let out = "", i = 0;
+      while (i < src.length) {
+        const c = src[i];
+        if (c === "\"") {
+          const end = stringEnd(src, i);
+          out += src.slice(i, end);
+          i = end;
+          continue;
+        }
+        if (c === "/" && src[i + 1] === "/") {
+          while (i < src.length && src[i] !== "\n") { out += " "; i += 1; }
+          continue;
+        }
+        if (c === "/" && src[i + 1] === "*") {
+          const start = i;
+          i += 2;
+          while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i += 1;
+          i += 2;
+          out += src.slice(start, i).replace(/[^\n]/g, " ");
+          continue;
+        }
+        out += c;
+        i += 1;
+      }
+      return out;
+    };
+    // Moves a closing bracket or brace to a line of its own when it is glued to
+    // the end of the line before it, indenting the new line with `indent`. A
+    // closer that already sits on its own line keeps the indentation it has.
     const closeOnOwnLine = (src, closeAt, indent) => {
       const lineStart = src.lastIndexOf("\n", closeAt) + 1;
       if (/^[ \t]*$/.test(src.slice(lineStart, closeAt))) return src;
@@ -574,25 +637,30 @@ make_entry() {
     if (text.trim() === "") {
       fs.writeFileSync(path, `{\n  "plugins": [\n${padLines(entry, "    ")}\n  ]\n}\n`);
     } else {
-      const m = /"plugins"\s*:\s*\[/.exec(text);
-      if (m && m.index !== undefined) {
-        // Insert as the first entry of the existing plugins array, keeping the
-        // file textual (comments and formatting are preserved).
-        const open = m.index + m[0].length;
-        const rest = text.slice(open);
-        const lineStart = text.lastIndexOf("\n", m.index) + 1;
-        const lineEnd = text.indexOf("\n", m.index);
+      let scan = scanJsonc(text);
+      if (scan.pluginsOpen !== -1) {
+        if (scan.pluginsClose === -1) {
+          console.error(`${process.env.MSG_ERROR_PREFIX}The "plugins" array is never closed — fix the config by hand.`);
+          process.exit(1);
+        }
+        // Insert as the first entry of the existing root "plugins" array,
+        // keeping the file textual (comments and formatting are preserved).
+        const open = scan.pluginsOpen + 1;
+        const lineStart = text.lastIndexOf("\n", scan.pluginsKey) + 1;
+        const lineEnd = text.indexOf("\n", scan.pluginsKey);
         const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
         const baseIndent = (/^([ \t]*)/.exec(line) || ["", ""])[1] || "";
         const indent = baseIndent + "  ";
-        const empty = /^\s*\]/.exec(rest);
-        if (empty) {
-          // Empty array: the entry goes between the brackets, with "]" put on
-          // its own line at the indentation of the "plugins" key.
-          const closeBracket = open + empty[0].length - 1;
-          text = text.slice(0, open) + "\n" + padLines(entry, indent) + "\n" + baseIndent + text.slice(closeBracket);
-        } else {
-          text = text.slice(0, open) + "\n" + padLines(entry, indent) + "," + text.slice(open);
+        // An array holding nothing but comments counts as empty: the entry goes
+        // between the brackets without a comma.
+        const empty = /^\s*$/.test(maskComments(text.slice(open, scan.pluginsClose)));
+        text = text.slice(0, open) + "\n" + padLines(entry, indent) + (empty ? "" : ",") + text.slice(open);
+        // The closing bracket of the array does not share its line with the
+        // entry (or the last element) before it: it gets its own line at the
+        // indentation of the "plugins" key.
+        scan = scanJsonc(text);
+        if (scan.pluginsClose !== -1) {
+          text = closeOnOwnLine(text, scan.pluginsClose, baseIndent);
         }
       } else {
         // No plugins key: add one before the root closing brace. The comma goes

@@ -35,11 +35,14 @@ your classifier settings.
   Findings are appended to the tool result so the agent can fix problems.
 - **Complexity classification** (`before_agent_start`): also injects a note
   suggesting a confidence check on medium/high.
-- **Tool exposure** (`before_agent_start`): decides which tools the task needs
-  and narrows the active set with `pi.setActiveTools()`, so the request carries
-  fewer tool schemas and saves input tokens. The always-keep set is the common
-  core (read/search/edit/shell/task) plus `reflex_run`, so the model keeps the
-  direct tools it reaches for constantly and only the long tail (web, exec,
+- **Tool exposure** (`before_agent_start`): decides which tool *groups* the
+  task needs (tools are judged by purpose — web, shell, edit, read, agents,
+  other — one question per group, not per tool) and narrows the active set with
+  `pi.setActiveTools()`, so the request carries fewer tool schemas and saves
+  input tokens; a kept group keeps its whole family of tools. The always-keep
+  set is the common core (read/search/edit/shell/task) plus `reflex_run`, so the
+  model keeps the direct tools it reaches for constantly and only the long tail
+  (web, exec,
   subagents…) is trimmed to what the task clearly needs or the model already used
   this session. Everything stays exposed if the classifier is
   unavailable. Disable with `AGENT_REFLEX_TOOLS=0`.
@@ -81,7 +84,7 @@ Two features carry real cost or override provider defaults, so they are opt-in:
 |---|---|
 | `AGENT_REFLEX_PRUNE=1` | Enable decision-driven history compaction (`context`). One classifier call per old message plus one batched digest call per model request — real latency and token cost. Off by default. |
 | `AGENT_REFLEX_MAXTOKENS=1` | Set the request token cap per level (`before_provider_request`), matching the plugin's `maxTokens` (simple 8192, medium 65536, high 131072). Overrides the provider's own cap. Off by default. |
-| `AGENT_REFLEX_TOOLS=0` | Disable tool exposure. When set to `0` (or `all`), every tool stays exposed. On by default (`auto`); makes one classifier batch call per prompt to score the tools. |
+| `AGENT_REFLEX_TOOLS=0` | Disable tool exposure. When set to `0` (or `all`), every tool stays exposed. On by default (`auto`); makes one classifier batch call per prompt to score the tool groups. |
 
 The effort tuning, guardrail, post-edit check, and confidence check are always on.
 

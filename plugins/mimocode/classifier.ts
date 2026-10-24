@@ -42,7 +42,7 @@ interface Config {
   debugLog?: string;
 }
 
-let configCache: Config | null | undefined;
+let configCache: Config | undefined;
 
 // Strips // line comments (only when // begins a token) and trailing commas so
 // JSON.parse can read JSONC.
@@ -59,14 +59,14 @@ function loadConfig(): Config {
     if (!existsSync(path)) continue;
     try {
       const parsed = JSON.parse(stripJsonc(readFileSync(path, "utf8")));
-      configCache = typeof parsed === "object" && parsed !== null ? parsed : {};
+      configCache = typeof parsed === "object" && parsed !== null ? (parsed as Config) : {};
       return configCache;
     } catch {
       // keep looking / fall through to empty
     }
   }
   configCache = {};
-  return configCache;
+  return configCache as Config;
 }
 
 export function config(key: keyof Config): string | undefined {
@@ -152,11 +152,12 @@ export async function arAsk(state: string, question: string): Promise<number | n
   return null;
 }
 
-// Maps a classifier score to a complexity level. Cut-offs match the plugin.
+// Maps a classifier score to a complexity level. Cut-offs match the plugin
+// (below 0.40 simple, above 0.70 high).
 export function classifyLevel(score: number): "simple" | "medium" | "high" {
-  if (score > 0.8) return "high";
-  if (score > 0.5) return "medium";
-  return "simple";
+  if (score > 0.7) return "high";
+  if (score < 0.4) return "simple";
+  return "medium";
 }
 
 // ---- "choice" decisions (used by history compaction's structured digest) ----

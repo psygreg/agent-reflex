@@ -93,6 +93,17 @@ function isToolCallPairMember(msg: any): boolean {
   return parts.some((p: any) => ["tool_use", "tool-call", "tool_result", "tool-result"].includes(String(p?.type)));
 }
 
+// True when the message IS the result half of a tool call: an OpenAI-style
+// "tool" role message, or content carrying tool_result / tool-result parts
+// (OpenCode v2 and Anthropic shapes). Mirrors resultIdsOf in the OpenCode
+// plugin (see plugins/opencode/index.ts); a call half (tool_calls or
+// tool_use parts) is not a result.
+function isToolResultMessage(msg: any): boolean {
+  if (msg?.role === "tool") return true;
+  const parts = Array.isArray(msg?.content) ? msg.content : [];
+  return parts.some((p: any) => ["tool_result", "tool-result"].includes(String(p?.type)));
+}
+
 type ChatMsg = { role?: string; content?: unknown; tool_calls?: unknown };
 function toChatMsg(msg: any): ChatMsg {
   const out: ChatMsg = {};
@@ -242,7 +253,7 @@ export default {
           return j !== undefined && (preservedIdx.has(j) || j >= distantPast.length);
         }) && ids.some((id) => {
           const j = idToIdx.get(id);
-          return j !== undefined && isToolResultContent(allMsgs[j]?.content);
+          return j !== undefined && isToolResultMessage(allMsgs[j]);
         });
       }
       if (linkable) {

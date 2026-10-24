@@ -152,11 +152,12 @@ export async function arAsk(state: string, question: string): Promise<number | n
   return null;
 }
 
-// Maps a classifier score to a complexity level. Cut-offs match the plugin.
+// Maps a classifier score to a complexity level. Cut-offs match the plugin
+// (below 0.40 simple, above 0.70 high).
 export function classifyLevel(score: number): "simple" | "medium" | "high" {
-  if (score > 0.8) return "high";
-  if (score > 0.5) return "medium";
-  return "simple";
+  if (score > 0.7) return "high";
+  if (score < 0.4) return "simple";
+  return "medium";
 }
 
 // Batched System One query: one request carrying a question per id, so a whole
