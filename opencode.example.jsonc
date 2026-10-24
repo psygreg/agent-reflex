@@ -43,6 +43,11 @@
     //                  trimmed to what the task needs or the model already used.
     //                  "all" keeps every tool exposed.
     //                  Everything is kept if the classifier is unavailable.
+    //   loopDetection  Stuck-loop guard: "auto" (default) watches completed tool
+    //                  calls and nudges the model when it repeats the same call.
+    //                  Identical arguments with identical output are flagged
+    //                  deterministically; repeats whose output varies are judged
+    //                  by the classifier. "off" disables the guard.
 
     // Classifier on a local llama.cpp server with the System One API (/systemone).
     // Effort control is automatic: every model that supports it gets effort written

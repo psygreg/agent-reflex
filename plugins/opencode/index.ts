@@ -1949,30 +1949,52 @@ function usedToolNames(messages: any[]): Set<string> {
 //   the loop running rather than yanking a legitimate long task to a halt.
 // - It only ever nudges via a system message. It never deletes history, stops
 //   the session, or edits the working copy.
-// Buffered calls are flushed into a loop check after this many new completions,
-// so a check runs at most once per several tool calls rather than on each one.
+// Buffered calls are flushed into a CLASSIFIER loop check after this many new
+// completions, so the classifier is asked at most once per several tool calls
+// rather than on each one. (The deterministic exact-loop check below runs on
+// every completed call: it is pure computation and costs nothing.)
 const LOOP_FLUSH_THRESHOLD = 2;
-// A run is considered for a loop check only after at least this many tool calls,
-// so short bursts of legitimate parallel calls are never flagged.
+// A run is considered for a classifier loop check only after at least this many
+// tool calls, so short bursts of legitimate parallel calls are never flagged.
 const LOOP_MIN_CALLS = 4;
 // The sliding window over which the repeating key must recur to count as a cycle.
 const LOOP_WINDOW = 8;
 // How many times a repeating key must appear within the window before we even
 // spend a classifier call. Two is the minimum to prove repetition at all.
 const LOOP_REPEAT_MIN = 2;
-// P(loop) at or above which we intervene. High on purpose: a false positive that
-// tells a working agent to stop is more costly than a loop that runs a little
-// longer.
+// Structural repetition strong enough to lower the classifier bar: the same
+// call this many times in the window proves the repetition itself, so the
+// classifier only has to judge productivity.
+const LOOP_REPEAT_STRONG = 3;
+// Deterministic loop: the same call producing the SAME result this many times
+// inside the recent tail is a loop on its face. Identical arguments AND
+// identical output mean the call cannot be moving the task forward, so this
+// needs no classifier judgement at all — it cannot fail because the classifier
+// is unavailable, slow or timid.
+const LOOP_EXACT_REPEATS = 3;
+const LOOP_EXACT_TAIL = 5;
+// P(loop) at or above which the classifier path intervenes. High on purpose: a
+// false positive that tells a working agent to stop is more costly than a loop
+// that runs a little longer. Loops with identical output never come this way;
+// they are caught deterministically.
 const LOOP_THRESHOLD = 0.82;
+// Lower bar once the same call recurs LOOP_REPEAT_STRONG times in the window:
+// the repetition is proven, only "is it productive" is in question.
+const LOOP_THRESHOLD_STRONG = 0.6;
+// After a warning is injected the guard goes quiet until the loop has repeated
+// this many more calls, then nudges again — the model may have ignored the
+// first warning, and one nudge does not always break a stubborn loop.
+const LOOP_REWARN_AFTER = 4;
 
 // One completed tool call reduced to what the guard needs to reason about. The
-// key carries the model's own JSON arguments (already compacted by the caller),
-// so identical calls and identical edits produce identical signatures.
+// key carries the model's own arguments canonically, so identical calls and
+// identical edits produce identical signatures regardless of argument order.
 interface LoopCall {
-  key: string; // tool name + argument signature (identity of the action)
+  key: string; // tool name + canonical argument signature (identity of the action)
   tool: string; // tool name, used to build the readable window fingerprint
   detail: string; // short human-readable summary of the call arguments
   result: string; // short human-readable summary of the tool result
+  resultKey: string; // normalized result identity ("did anything change?")
 }
 
 // Cuts a human-readable summary to a bounded length, collapsing whitespace so a
@@ -1984,29 +2006,51 @@ function loopTruncate(text: string, max: number): string {
 
 // A detected repeating cycle: the key that repeats, how many of the last few
 // calls carry it, and a couple of concrete examples so the model can see the
-// repetition rather than take the guard's word for it.
+// repetition rather than take the guard's word for it. `exact` marks the
+// deterministic case — same arguments AND same output every time.
 interface LoopCandidate {
   key: string;
   count: number;
   detail: string;
   samples: string[];
+  exact: boolean;
 }
 
-// Stable identity for a completed call: the tool name plus the normalized JSON
-// arguments. Whitespace inside string values is collapsed so a cosmetic reflow
-// of the same argument does not look like a new action, and the value is capped
-// so one huge call cannot bloat every key.
-function loopCallKey(tool: string, argsJson: string): string {
-  const normalized = argsJson.replace(/\s+/g, " ").trim().slice(0, 1_200);
-  return `${tool}::${normalized}`;
+// Canonical JSON for call identity: object keys sorted, string whitespace
+// collapsed, so {pattern, path} and {path, pattern} — or a cosmetic reflow of
+// the same argument — are one action, not two. Depth and breadth are capped so
+// one huge call cannot bloat every key.
+function canonicalJson(value: any, depth = 0): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "string") return JSON.stringify(value.replace(/\s+/g, " ").trim());
+  if (typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (depth > 6) return "\"...\"";
+  if (Array.isArray(value)) return `[${value.slice(0, 40).map((v) => canonicalJson(v, depth + 1)).join(",")}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k], depth + 1)}`).join(",")}}`;
 }
 
-// Pull a short human-readable summary out of the arguments: the file path or
-// query/URL/command when present, else the tool name. This is what the injected
-// message shows the model so it can recognize the call it keeps making.
+// Stable identity for a completed call: the tool name plus the canonical
+// arguments. Whitespace inside string values is collapsed and the value is
+// capped so one huge call cannot bloat every key.
+function loopCallKey(tool: string, args: any): string {
+  const normalized = typeof args === "string"
+    ? args.replace(/\s+/g, " ").trim()
+    : canonicalJson(args);
+  return `${tool}::${normalized.slice(0, 1_200)}`;
+}
+
+// Pull a short human-readable summary out of the arguments: what the call acts
+// on (pattern/query/command) and where (file path/URL), so the model can
+// recognize the exact call it keeps making. For a grep that is the pattern AND
+// the searched path — the path alone identifies nothing.
 function loopCallDetail(tool: string, args: any): string {
   if (args && typeof args === "object") {
-    const target = pickString(args, ["filePath", "path", "file", "url", "query", "command", "pattern", "symbol"]);
+    const target = pickString(args, ["filePath", "path", "file", "directory", "dir", "url"]);
+    const spec = pickString(args, ["pattern", "query", "command", "symbol", "expression"]);
+    const head = spec ? `${tool} ${spec.slice(0, 120)}` : `${tool}`;
+    if (spec && target) return `${head} in ${target.slice(0, 80)}`;
+    if (spec) return head;
     if (target) return `${tool} ${target.slice(0, 160)}`;
   }
   return tool;
@@ -2016,8 +2060,15 @@ function loopCallDetail(tool: string, args: any): string {
 // changed" from "the call produced something". Compressed aggressively so the
 // injected message stays small.
 function loopResultDetail(result: unknown): string {
-  const text = contentToText(result).replace(/\s+/g, " ").trim();
-  return text.slice(0, 120);
+  return loopTruncate(contentToText(result), 120);
+}
+
+// Normalized identity of a tool result: two runs of the same call count as
+// "nothing changed" only when these match. Uses the full normalized text (not
+// the 120-char display digest) so two different long outputs cannot look
+// identical by truncation, capped to bound memory.
+function loopResultKey(result: unknown): string {
+  return contentToText(result).replace(/\s+/g, " ").trim().slice(0, 4_000);
 }
 
 // Extract the first non-empty string among the given argument names.
@@ -2029,10 +2080,45 @@ function pickString(args: any, names: string[]): string | undefined {
   return undefined;
 }
 
+// Deterministic detector: the same call with the SAME result LOOP_EXACT_REPEATS
+// times inside the last LOOP_EXACT_TAIL completed calls. Identical arguments and
+// identical output mean the call cannot be moving the task forward — no
+// classifier needed, no matter how the classifier feels about it. Returns null
+// when the recent tail looks varied.
+function findExactLoop(window: LoopCall[]): LoopCandidate | null {
+  const tail = window.slice(-LOOP_EXACT_TAIL);
+  const byKey = new Map<string, Map<string, LoopCall[]>>();
+  for (const call of tail) {
+    const byResult = byKey.get(call.key) ?? new Map<string, LoopCall[]>();
+    const list = byResult.get(call.resultKey) ?? [];
+    list.push(call);
+    byResult.set(call.resultKey, list);
+    byKey.set(call.key, byResult);
+  }
+  let best: LoopCandidate | null = null;
+  for (const [key, byResult] of byKey) {
+    for (const calls of byResult.values()) {
+      if (calls.length < LOOP_EXACT_REPEATS) continue;
+      if (!best || calls.length > best.count) {
+        best = {
+          key,
+          count: calls.length,
+          detail: calls[calls.length - 1].detail,
+          samples: calls.slice(-2).map((c) => `${c.detail} -> ${c.result || "no output"}`),
+          exact: true,
+        };
+      }
+    }
+  }
+  return best;
+}
+
 // Scan the recent window for a key that repeats enough to be a cycle. Returns the
 // most frequent such key, or null when the run looks varied. An alternating A/B
 // cycle (key, other, key, other) still counts because the key recurs inside the
-// window even though it is never strictly adjacent.
+// window even though it is never strictly adjacent. Results are NOT part of this
+// identity: a repeating call whose output keeps changing is judged by the
+// classifier, not declared a loop outright.
 function findLoopCandidate(window: LoopCall[]): LoopCandidate | null {
   const counts = new Map<string, LoopCall[]>();
   for (const call of window) {
@@ -2045,51 +2131,61 @@ function findLoopCandidate(window: LoopCall[]): LoopCandidate | null {
     if (calls.length < LOOP_REPEAT_MIN) continue;
     if (!best || calls.length > best.count) {
       const samples = calls.slice(-2).map((c) => c.detail);
-      best = { key, count: calls.length, detail: calls[calls.length - 1].detail, samples };
+      best = { key, count: calls.length, detail: calls[calls.length - 1].detail, samples, exact: false };
     }
   }
   return best;
 }
 
-// Runs the loop judgement over the sliding window and, on a confident loop,
-// returns the message text to inject. Reuses askSystemOneQueued so the loop
-// verdict rides along with any other pending decision in the same batch. The
-// verdict is cached per candidate key so re-detecting the same active loop does
-// not re-ask the classifier every flush.
-async function checkLoopAndBuildWarning(
-  calls: LoopCall[],
-  ask: (state: string, question: string) => Promise<number | null>,
-  verdicts: Map<string, number>,
-): Promise<string | null> {
-  if (calls.length < LOOP_MIN_CALLS) return null;
-  const window = calls.slice(-LOOP_WINDOW);
-  const candidate = findLoopCandidate(window);
-  if (!candidate) return null;
+// The injected nudge. Names the offending call and its evidence so the model can
+// see the repetition rather than take the guard's word for it. Soft by design:
+// it asks for a change of approach, it never stops the session or edits the
+// working copy.
+function buildLoopWarning(candidate: LoopCandidate, window: LoopCall[], loopScore: number | null): string {
+  const samples = candidate.samples.length ? `; e.g. ${candidate.samples.join("; ")}` : "";
+  const verdict = candidate.exact
+    ? `with IDENTICAL arguments and IDENTICAL output every time, so it cannot be moving the task forward`
+    : `without converging, and looks like an unproductive loop (${Math.round((loopScore ?? 0) * 100)}% confident)`;
+  return (
+    `${candidate.exact ? "[Stuck loop detected]" : "[System One loop check]"}: The last ${window.length} tool calls repeat the same action ` +
+    `(${candidate.detail}${samples}) ${candidate.count} times ${verdict}. Stop repeating it. Change your approach: ` +
+    `inspect what the repeated result is telling you, try a different method, or summarize ` +
+    `what you have found and ask the user how to proceed. Do not run this same call again ` +
+    `unless the situation has clearly changed.`
+  );
+}
 
-  let loopScore = verdicts.get(candidate.key);
+// Classifier path for a structurally repeated call whose OUTPUT varies: judges
+// whether the repetition is a productive effort or an unproductive loop. Reuses
+// askSystemOneQueued so the verdict rides along with any other pending decision
+// in the same batch. The verdict is cached per repeating key TOGETHER with the
+// repeat count it was judged at: the same active loop is not re-judged every
+// flush, but a loop that has grown past the judged count IS re-judged because
+// the evidence changed (a verdict from two repeats must not excuse ten).
+async function checkLoopAndBuildWarning(
+  window: LoopCall[],
+  candidate: LoopCandidate,
+  ask: (state: string, question: string) => Promise<number | null>,
+  verdicts: Map<string, { score: number; count: number }>,
+): Promise<string | null> {
+  const cached = verdicts.get(candidate.key);
+  let loopScore = cached && candidate.count <= cached.count ? cached.score : undefined;
   if (loopScore === undefined) {
     const state =
       `Recent tool calls in this coding session, oldest to newest:\n` +
-      window.map((c, i) => `${i + 1}. ${c.detail} -> ${c.result}`).join("\n");
+      window.map((c, i) => `${i + 1}. ${c.detail} -> ${c.result || "no output"}`).join("\n");
     const question =
       `Is the agent stuck in an unproductive loop — repeating the same tool call or edit ` +
       `(${candidate.detail}) without making progress toward finishing the task — rather than doing varied, productive work?`;
     const score = await ask(state, question);
     if (score === null) return null; // classifier unavailable: fail open
     loopScore = score;
-    verdicts.set(candidate.key, score);
+    verdicts.set(candidate.key, { score, count: candidate.count });
   }
 
-  if (loopScore < LOOP_THRESHOLD) return null;
-  return (
-    `[System One loop check]: The last ${window.length} tool calls repeat the same action ` +
-    `(${candidate.detail}${candidate.samples.length ? `; e.g. ${candidate.samples.join("; ")}` : ""}) ` +
-    `${candidate.count} times without converging, and look like an unproductive loop ` +
-    `(${(loopScore * 100).toFixed(0)}% confident). Stop repeating it. Change your approach: ` +
-    `inspect what the repeated result is telling you, try a different method, or summarize ` +
-    `what you have found and ask the user how to proceed. Do not run this same call again ` +
-    `unless the situation has clearly changed.`
-  );
+  const threshold = candidate.count >= LOOP_REPEAT_STRONG ? LOOP_THRESHOLD_STRONG : LOOP_THRESHOLD;
+  if (loopScore < threshold) return null;
+  return buildLoopWarning(candidate, window, loopScore);
 }
 
 // Applies precomputed request-level decisions to the mutable tool map. The
@@ -2339,16 +2435,21 @@ export default Plugin.define({
 
     // Loop guard state. `loopCallsBySession` is a bounded sliding window of the
     // session's most recent completed tool calls (fingerprint + summaries);
-    // `loopPendingBySession` buffers calls since the last loop check so the
-    // classifier is queried at most once per LOOP_FLUSH_THRESHOLD calls;
-    // `loopVerdictsBySession` caches the verdict per repeating key so an active
-    // loop is not re-judged every flush; `loopWarnedBySession` marks that the
-    // guard has already fired for the current loop so it nudges once, not on
-    // every subsequent call.
+    // `loopCallCountBySession` counts every completed call monotonically so
+    // "warned N calls ago" stays meaningful once the window starts trimming;
+    // `loopPendingBySession` buffers calls since the last CLASSIFIER check so
+    // the classifier is queried at most once per LOOP_FLUSH_THRESHOLD calls;
+    // `loopVerdictsBySession` caches the verdict per repeating key together with
+    // the repeat count it was judged at, so an active loop is not re-judged
+    // every flush but a growing loop is; `loopWarnedBySession`/`loopWarnedAt`
+    // mark that the guard has fired for the current loop so it nudges once and
+    // then again only if the loop persists past LOOP_REWARN_AFTER more calls.
     const loopCallsBySession = new Map<string, LoopCall[]>();
+    const loopCallCountBySession = new Map<string, number>();
     const loopPendingBySession = new Map<string, number>();
-    const loopVerdictsBySession = new Map<string, Map<string, number>>();
+    const loopVerdictsBySession = new Map<string, Map<string, { score: number; count: number }>>();
     const loopWarnedBySession = new Map<string, string>();
+    const loopWarnedAtBySession = new Map<string, number>();
     const loopWarningsBySession = new Map<string, string>();
 
     // ==========================================
@@ -2391,33 +2492,18 @@ export default Plugin.define({
       // A guard verdict is decided incrementally in the execute.after hook as
       // tool calls complete; here we only inject its warning into the model
       // input for the very next call so the model can pull out of the loop.
-      // Injected before compaction so it is never folded away.
-      const loopKey = loopWarnedBySession.get(event.sessionID);
-      if (loopKey) {
-        const decision = loopWarningsBySession.get(event.sessionID);
-        if (decision) {
-          // Classifier-derived warning: names the offending calls and the model's
-          // evidence for a loop. Sent once (cleared here) so it cannot accumulate
-          // across model calls.
-          loopWarningsBySession.delete(event.sessionID);
-          event.system.push({ type: "text", text: decision });
-        } else {
-          // Generic fallback when no classifier verdict is on file.
-          const calls = loopCallsBySession.get(event.sessionID) ?? [];
-          const seen = calls.filter((c) => c.key === loopKey);
-          const last = seen[seen.length - 1];
-          const n = seen.length;
-          const fingerprint = last
-            ? `${loopTruncate(last.detail, 160) || "no args"} -> ${loopTruncate(last.result, 120)}`
-            : loopKey;
-          event.system.push({
-            type: "text",
-            text:
-              `STUCK LOOP DETECTED: you are repeating tool calls without making progress. The last ${n} calls in this session followed the same pattern and produced the same result:\n` +
-              `  ...\n  ${fingerprint}\n  ...\n` +
-              `Stop repeating these calls now. Change your approach: inspect a different file, try a distinct command or argument, or explain the blocker to the user and ask for direction. A different argument or tool is required before continuing.`,
-          });
-        }
+      // Injected before compaction so it is never folded away. The warning is
+      // CONSUMED on injection — one nudge per arming — so a model that ignores
+      // it is not spammed on every subsequent call; it is nudged again only
+      // when the guard re-arms after LOOP_REWARN_AFTER more loop calls. Both
+      // guard paths always arm with their own text (the identical-output proof
+      // or the classifier verdict), so there is no separate fallback message.
+      const decision = loopWarningsBySession.get(event.sessionID);
+      if (decision) {
+        // Names the offending calls and the evidence for the loop, so the model
+        // can see the repetition rather than take the guard's word for it.
+        loopWarningsBySession.delete(event.sessionID);
+        event.system.push({ type: "text", text: decision });
       }
 
       const previousTools = availableToolsBySession.get(event.sessionID);
@@ -3052,10 +3138,13 @@ export default Plugin.define({
     // ==========================================
     // HOOK 5: LOOP GUARD (capture completed tool calls)
     // Watches every completed tool call and feeds the session's sliding window
-    // of fingerprints. After LOOP_FLUSH_THRESHOLD new calls the run is judged by
-    // checkLoopAndBuildWarning; a confident loop arms the warning the context
-    // hook injects on the next model call. Runs on all tools (a loop can be a
-    // repeated read/search/shell call, not just an edit).
+    // of fingerprints. The deterministic check — same call, same result, several
+    // times in the recent tail — runs on every completed call and needs no
+    // classifier. Structurally repeated calls whose output varies are judged by
+    // the classifier at most once per LOOP_FLUSH_THRESHOLD new calls; a
+    // confident loop arms the warning the context hook injects on the next model
+    // call. Runs on all tools (a loop can be a repeated read/search/shell call,
+    // not just an edit).
     // ==========================================
     await ctx.tool.hook("execute.after", async (event: any) => {
       if (event.status !== "completed") return;
@@ -3063,43 +3152,64 @@ export default Plugin.define({
       if (!sessionID) return;
       if (config.loopDetection === "off") return;
 
+      const tool = String(event.tool ?? "unknown");
       const args = event.input ?? event.args ?? {};
-      const argsJson = typeof args === "string" ? args : JSON.stringify(args);
-      const key = loopCallKey(String(event.tool ?? "unknown"), argsJson);
-      const detail = loopCallDetail(String(event.tool ?? "unknown"), args);
-      const result = loopResultDetail(event.state?.output ?? event.output ?? event.result);
+      const output = event.state?.output ?? event.output ?? event.result;
+      const key = loopCallKey(tool, args);
+      const detail = loopCallDetail(tool, args);
+      const result = loopResultDetail(output);
 
       const calls = loopCallsBySession.get(sessionID) ?? [];
-      calls.push({ tool: String(event.tool ?? "unknown"), key, detail, result });
+      calls.push({ tool, key, detail, result, resultKey: loopResultKey(output) });
       if (calls.length > LOOP_WINDOW * 2) calls.splice(0, calls.length - LOOP_WINDOW * 2);
       loopCallsBySession.set(sessionID, calls);
 
-      const pending = (loopPendingBySession.get(sessionID) ?? 0) + 1;
-      if (pending < LOOP_FLUSH_THRESHOLD) {
-        loopPendingBySession.set(sessionID, pending);
-        return;
-      }
-      loopPendingBySession.set(sessionID, 0);
+      const seenCount = (loopCallCountBySession.get(sessionID) ?? 0) + 1;
+      loopCallCountBySession.set(sessionID, seenCount);
 
-      // Judge the run at most once every few calls. The classifier verdict is
-      // cached per repeating key, so an active loop is not re-asked each flush.
+      const pending = (loopPendingBySession.get(sessionID) ?? 0) + 1;
+      const flush = pending >= LOOP_FLUSH_THRESHOLD;
+      loopPendingBySession.set(sessionID, flush ? 0 : pending);
+
+      // The exact-loop check is pure computation over the window, so it runs on
+      // every completed call; only the classifier judgement waits for a flush.
       try {
-        const candidate = findLoopCandidate(calls.slice(-LOOP_WINDOW));
-        if (candidate && loopWarnedBySession.get(sessionID) === candidate.key) {
-          // Already warned about this exact loop: keep quiet instead of spamming
-          // the same message on every subsequent flush.
-          return;
+        const window = calls.slice(-LOOP_WINDOW);
+        const exact = findExactLoop(window);
+        const candidate = exact ?? (flush && calls.length >= LOOP_MIN_CALLS ? findLoopCandidate(window) : null);
+        if (!candidate) return;
+
+        // Warn once per loop, then go quiet until the loop has repeated some
+        // more — the model may simply have ignored the first nudge.
+        const warnedKey = loopWarnedBySession.get(sessionID);
+        const warnedAt = loopWarnedAtBySession.get(sessionID) ?? 0;
+        if (warnedKey === candidate.key && seenCount - warnedAt < LOOP_REWARN_AFTER) return;
+
+        let warning: string | null = null;
+        if (candidate.exact) {
+          // Deterministic: identical arguments and identical output need no
+          // classifier verdict (and cannot fail when the classifier is down).
+          warning = buildLoopWarning(candidate, window, null);
+        } else {
+          // The verdict cache must persist across flushes (and grow with the
+          // evidence), so it lives in loopVerdictsBySession rather than in a
+          // throwaway map.
+          const verdicts = loopVerdictsBySession.get(sessionID) ?? new Map();
+          loopVerdictsBySession.set(sessionID, verdicts);
+          warning = await checkLoopAndBuildWarning(
+            window,
+            candidate,
+            (state, question) => askSystemOneQueued(state, question),
+            verdicts,
+          );
         }
-        const warning = await checkLoopAndBuildWarning(
-          calls,
-          (state, question) => askSystemOneQueued(state, question),
-          loopVerdictsBySession.get(sessionID) ?? new Map(),
-        );
-        if (warning && candidate) {
+        if (warning) {
           // Arm the warning the context hook injects on the next model call, and
-          // mark this key warned so it nudges once per loop rather than per flush.
+          // mark this key warned so it nudges once per loop, then only again
+          // after LOOP_REWARN_AFTER more calls of the same loop.
           loopWarningsBySession.set(sessionID, warning);
           loopWarnedBySession.set(sessionID, candidate.key);
+          loopWarnedAtBySession.set(sessionID, seenCount);
         }
       } catch {
         // Fail open: never break the run because the loop guard errored.

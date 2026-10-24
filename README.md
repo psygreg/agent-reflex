@@ -22,7 +22,7 @@ feature below is driven by this classifier.
 - **Syntax checks**: up to two-step checks after `edit` and `write` tool calls using parsers and the decision model
 - **Shell guardrail**: blocks commands that may damage a repository or remove files without backup; the check runs before dispatch through `reflex_run` as well
 
-- **Stuck-loop detection**: watches completed tool calls and, when the same call repeats and keeps producing the same result, injects a System One-verified "stuck loop" warning into the next model call telling the model to change approach. The classifier verdict is cached per repeating pattern so an active loop is not re-judged on every flush, and detection is deliberately conservative (only a call that repeats several times *with identical output* is a loop) so legitimate iteration passes through untouched
+- **Stuck-loop detection**: watches completed tool calls and breaks repetitive cycles. When the *same call keeps producing the same result* — identical arguments and identical output, several times in the last few calls — it is flagged deterministically as a stuck loop, no classifier involved, and a warning naming the repeated call and its evidence is injected into the next model call telling the model to change approach; a repeated call whose output *varies* is judged by the System One classifier instead (with a lower bar once the repetition is structurally proven, and the verdict cached per repeating pattern but re-judged as the loop grows). Detection is conservative so legitimate iteration passes through untouched: the warning is a nudge, never a stop, it is delivered once per loop and repeated only if the loop persists
 
 ### Agent support
 
