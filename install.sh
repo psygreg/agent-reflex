@@ -530,16 +530,49 @@ make_entry() {
       ...(process.env.PLUGIN_FALLBACK_MODEL ? { fallbackModel: process.env.PLUGIN_FALLBACK_MODEL } : {}),
       ...(process.env.PLUGIN_DEBUG_LOG ? { debugLog: process.env.PLUGIN_DEBUG_LOG } : {}),
     };
-    // Every line of the entry is indented by 4 spaces: it lands inside the
-    // "plugins": [ ... ] array whose elements sit at that depth.
-    const entry = JSON.stringify({ package: "./plugins/reflex", options }, null, 2)
-      .split("\n").map((l) => "    " + l).join("\n");
+    // The entry block keeps the 2-space indentation JSON.stringify produces;
+    // each use site shifts it to the depth of its own "plugins" array.
+    const entry = JSON.stringify({ package: "./plugins/reflex", options }, null, 2);
+    const padLines = (block, pad) => block.split("\n").map((l) => pad + l).join("\n");
+    // String- and comment-aware scan of a JSONC source: reports where the last
+    // real character ends (comments and blank space excluded) and which "}"
+    // closes the root object, so neither can be fooled by commas or braces
+    // that only appear inside comments or strings.
+    const scanJsonc = (src) => {
+      let i = 0, lastReal = 0, rootClose = -1, depth = 0;
+      while (i < src.length) {
+        const c = src[i];
+        if (c === "\"") {
+          i += 1;
+          while (i < src.length && src[i] !== "\"") i += src[i] === "\\" ? 2 : 1;
+          i += 1;
+          lastReal = i;
+          continue;
+        }
+        if (c === "/" && src[i + 1] === "/") { while (i < src.length && src[i] !== "\n") i += 1; continue; }
+        if (c === "/" && src[i + 1] === "*") { i += 2; while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i += 1; i += 2; continue; }
+        i += 1;
+        if (/\s/.test(c)) continue;
+        lastReal = i;
+        if (c === "{") depth += 1;
+        if (c === "}" && --depth === 0 && rootClose === -1) rootClose = i - 1;
+      }
+      return { lastReal, rootClose };
+    };
+    // Moves the root closing brace to a line of its own when it is glued to the
+    // end of the line before it, indenting the new line with `indent`. A brace
+    // that already sits on its own line keeps the indentation it has.
+    const closeOnOwnLine = (src, closeAt, indent) => {
+      const lineStart = src.lastIndexOf("\n", closeAt) + 1;
+      if (/^[ \t]*$/.test(src.slice(lineStart, closeAt))) return src;
+      return src.slice(0, closeAt).replace(/[ \t]+$/, "") + "\n" + indent + src.slice(closeAt);
+    };
 
     const path = process.env.CONFIG_FILE || "";
     let text = path && fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
 
     if (text.trim() === "") {
-      fs.writeFileSync(path, `{\n  "plugins": [\n${entry}\n  ]\n}\n`);
+      fs.writeFileSync(path, `{\n  "plugins": [\n${padLines(entry, "    ")}\n  ]\n}\n`);
     } else {
       const m = /"plugins"\s*:\s*\[/.exec(text);
       if (m && m.index !== undefined) {
@@ -552,26 +585,47 @@ make_entry() {
         const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
         const baseIndent = (/^([ \t]*)/.exec(line) || ["", ""])[1] || "";
         const indent = baseIndent + "  ";
-        if (/^\s*\]/.test(rest)) {
-          text = text.slice(0, open) + `\n${indent}${entry}\n${baseIndent}` + text.slice(open);
+        const empty = /^\s*\]/.exec(rest);
+        if (empty) {
+          // Empty array: the entry goes between the brackets, with "]" put on
+          // its own line at the indentation of the "plugins" key.
+          const closeBracket = open + empty[0].length - 1;
+          text = text.slice(0, open) + "\n" + padLines(entry, indent) + "\n" + baseIndent + text.slice(closeBracket);
         } else {
-          text = text.slice(0, open) + `\n${indent}${entry},` + text.slice(open);
+          text = text.slice(0, open) + "\n" + padLines(entry, indent) + "," + text.slice(open);
         }
       } else {
-        // No plugins key: add one before the root closing brace. A trailing
+        // No plugins key: add one before the root closing brace. The comma goes
+        // after the last real value — never after a comment — and a trailing
         // comma (or an empty root object) must not produce a double comma.
         const trimmed = text.replace(/\s+$/, "");
-        const lastBrace = trimmed.lastIndexOf("}");
-        if (lastBrace === -1) {
+        const rootClose = scanJsonc(trimmed).rootClose;
+        if (rootClose === -1) {
           console.error(`${process.env.MSG_ERROR_PREFIX}Config file has no closing brace — not a JSON object?`);
           process.exit(1);
         }
-        const core = trimmed.slice(0, lastBrace).replace(/\s+$/, "");
-        const comma = core.endsWith(",") || core === "{" ? "" : ",";
-        text =
-          core + comma +
-          `\n  "plugins": [\n${entry}\n  ]` +
-          trimmed.slice(lastBrace) + "\n";
+        const core = trimmed.slice(0, rootClose).replace(/\s+$/, "");
+        const lastReal = scanJsonc(core).lastReal;
+        const prev = core[lastReal - 1];
+        const comma = lastReal > 0 && prev !== "," && prev !== "{" ? "," : "";
+        // The root closing brace keeps its own line and the indentation it
+        // already had there; glued to the line before (minified or inline) it
+        // closes at the indentation of the first line of the file.
+        const braceLineStart = trimmed.lastIndexOf("\n", rootClose) + 1;
+        const bracePrefix = trimmed.slice(braceLineStart, rootClose);
+        const firstIndent = (/^[ \t]*/.exec(text) || [""])[0] || "";
+        const closeIndent = /^[ \t]*$/.test(bracePrefix) ? bracePrefix : firstIndent;
+        const head =
+          core.slice(0, lastReal) + comma + core.slice(lastReal) +
+          `\n  "plugins": [\n${padLines(entry, "    ")}\n  ]`;
+        text = closeOnOwnLine(head + trimmed.slice(rootClose), head.length, closeIndent) + "\n";
+      }
+      // Whichever branch spliced the text, the root closing brace does not
+      // share its line with the "]" before it (a minified file arrives that
+      // way): move it to a line of its own.
+      const mergedClose = scanJsonc(text).rootClose;
+      if (mergedClose !== -1) {
+        text = closeOnOwnLine(text, mergedClose, (/^[ \t]*/.exec(text) || [""])[0] || "");
       }
       // Validate before committing: back up, strip comments and trailing
       // commas, and make sure the merged file still parses.
